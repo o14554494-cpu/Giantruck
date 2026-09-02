@@ -194,7 +194,8 @@ MissionDriveOutput_t MissionExtension_UpdateUnload(const RobotPose_t *pose,
         Mission_SetUnloadState(MISSION_UNLOAD_DONE, now_ms);
         return Mission_Output(0, 0, 0, 1U, 1U);
       }
-      return Mission_Output(0, 0, -700, 1U, 0U);
+      /* Rear servo performs ejection; the front brush has independent power. */
+      return Mission_Output(0, 0, 0, 1U, 0U);
 
     case MISSION_UNLOAD_DONE:
       return Mission_Output(0, 0, 0, 0U, 1U);

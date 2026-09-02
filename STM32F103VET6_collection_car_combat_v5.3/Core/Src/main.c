@@ -108,6 +108,8 @@ typedef enum
 #define AUTO_RECOVER_DURATION_MS           900U
 #define AUTO_VISION_TIMEOUT_MS             1200U
 #define AUTO_VISION_RETRY_MS               500U
+/* Independent front brush: runs continuously after peripheral startup.
+ * Raw TIM8 compare value, 0..1000; 500 = 50% duty. */
 #define COLLECTOR_RUN_PWM                  500U
 #define AUTO_REPLAN_PERIOD_MS              700U
 #define AUTO_EMPTY_RESCAN_LIMIT             1U
@@ -151,6 +153,9 @@ typedef enum
  * is backing away from a front wall. */
 #define LEGACY_REAR_HCSR04_STOP_ENABLE 0U
 
+/* 电机启动补偿参数 */
+#define MOTOR_BOOST_PERCENT        80U     /* 启动时的高占空比（建议70~90） */
+#define MOTOR_BOOST_DURATION_MS    200U    /* 启动补偿持续时间（建议150~300ms） */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -212,6 +217,12 @@ static uint8_t servo_test_active;
 static uint8_t buzzer_active;
 static uint8_t buzzer_pending_pulses;
 static uint32_t buzzer_state_tick;
+
+/* 电机启动补偿状态（每个通道独立） */
+static int16_t  ch1_last_target = 0;       /* CH1上一次的目标占空比 */
+static int16_t  ch2_last_target = 0;       /* CH2上一次的目标占空比 */
+static uint32_t ch1_boost_start_tick = 0;  /* CH1启动补偿开始时间 */
+static uint32_t ch2_boost_start_tick = 0;  /* CH2启动补偿开始时间 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -253,9 +264,7 @@ static const VisionTarget_t *Auto_FindCurrentVisionTarget(void);
 static const char *Auto_StateName(AutoState_t state);
 static void Mission_UpdateIntegration(void);
 static void CollectorDirection_Init(void);
-static void motor3_reverse(uint16_t speed);
 void motor3_forward(uint16_t speed);
-void motor3_stop(void);
 static uint8_t Auto_CheckVision(uint32_t now);
 static void Mission_ServoUpdate(MissionUnloadState_t unload_state,
                                 uint32_t now_ms);
@@ -380,7 +389,23 @@ static void Motor_SetOne(GPIO_TypeDef *in1_port, uint16_t in1_pin,
   uint32_t duty;
   uint32_t period;
   int16_t magnitude;
+  int16_t target_magnitude;
+  int16_t  *last_target;
+  uint32_t *boost_start;
 
+  /* 根据通道选择对应的状态变量 */
+  if (channel == TIM_CHANNEL_1)
+  {
+    last_target = &ch1_last_target;
+    boost_start = &ch1_boost_start_tick;
+  }
+  else
+  {
+    last_target = &ch2_last_target;
+    boost_start = &ch2_boost_start_tick;
+  }
+
+  /* 速度限幅 */
   if (speed_percent > 100)
   {
     speed_percent = 100;
@@ -390,6 +415,7 @@ static void Motor_SetOne(GPIO_TypeDef *in1_port, uint16_t in1_pin,
     speed_percent = -100;
   }
 
+  /* 根据速度正负设置方向引脚 */
   if (speed_percent > 0)
   {
     HAL_GPIO_WritePin(in1_port, in1_pin, GPIO_PIN_SET);
@@ -409,9 +435,32 @@ static void Motor_SetOne(GPIO_TypeDef *in1_port, uint16_t in1_pin,
     magnitude = 0;
   }
 
+  /* 保存目标占空比（用于下次判断是否从停止启动） */
+  target_magnitude = magnitude;
+
+  /* ========== 启动补偿逻辑 ========== */
+  if (magnitude > 0)
+  {
+    /* 检测是否从停止状态启动（上一次目标为0，本次非0） */
+    if (*last_target == 0)
+    {
+      *boost_start = HAL_GetTick();   /* 记录启动时间 */
+    }
+
+    /* 在boost持续时间内，使用高占空比 */
+    if ((HAL_GetTick() - *boost_start) < MOTOR_BOOST_DURATION_MS)
+    {
+      magnitude = MOTOR_BOOST_PERCENT;
+    }
+  }
+  /* ================================== */
+
+  /* 记录本次目标占空比 */
+  *last_target = target_magnitude;
+
+  /* 计算PWM占空比并写入比较寄存器 */
   period = __HAL_TIM_GET_AUTORELOAD(&htim3);
-  /* PWM period is ARR+1 ticks; round up so a requested 60% is not 59.98%. */
-  duty = ((uint32_t)magnitude * (period + 1U) + 99U) / 100U;
+  duty = ((uint32_t)magnitude * period) / 100U;
   __HAL_TIM_SET_COMPARE(&htim3, channel, duty);
 }
 
@@ -714,11 +763,12 @@ static void Motor_SendStatus(void)
                  (unsigned int)vision_motion_hold);
   Motor_SendText(status);
   (void)snprintf(status, sizeof(status),
-                 "UNLOAD=%s PAYLOAD=%u SERVO=%s FRONT=%lu mm\r\n",
+                 "UNLOAD=%s PAYLOAD=%u SERVO=%s FRONT=%lu mm BRUSH=CONT PWM=%u/1000\r\n",
                  MissionExtension_UnloadStateName(),
                  (unsigned int)MissionExtension_HasPayload(),
                  (Servo_IsRunning() != 0U) ? "RUN" : "OFF",
-                 (unsigned long)hc_distance_mm);
+                 (unsigned long)hc_distance_mm,
+                 (unsigned int)COLLECTOR_RUN_PWM);
   Motor_SendText(status);
   (void)snprintf(status, sizeof(status),
                  "COMBAT=%s ELAPSED=%lu PAYLOAD=%u OPP_DWELL=%lu\r\n",
@@ -845,10 +895,9 @@ static void Auto_StartScan(uint32_t timeout_ms)
   auto_state = AUTO_SCAN;
   auto_state_start_tick = HAL_GetTick();
   Vision_SendMode('S', 0U);
-  /* The next Auto_Update must pass the vision gate before any movement.
-   * This also covers the next combat batch after unloading stopped motor 3. */
+  /* The next Auto_Update must pass the vision gate before wheel movement.
+   * The front brush runs independently of this state machine. */
   Motor_Stop();
-  motor3_stop();
 }
 
 static void Auto_Start(void)
@@ -1088,7 +1137,7 @@ static void Auto_DriveTowardLocal(float forward_mm, float left_mm,
                   (int16_t)(base_speed + turn));
 }
 
-/* Loss of complete, checksum-validated frames holds autonomous collection.
+/* Loss of complete, checksum-validated frames holds autonomous wheel motion.
  * Manual control and an already-started odometry-based unload are separate.
  * On recovery rescan instead of resuming a partly completed pickup. */
 static uint8_t Auto_CheckVision(uint32_t now)
@@ -1103,7 +1152,6 @@ static uint8_t Auto_CheckVision(uint32_t now)
       ((uint32_t)(now - latest_vision_tick) > AUTO_VISION_TIMEOUT_MS))
   {
     Motor_Stop();
-    motor3_stop();
     if (vision_motion_hold == 0U)
     {
       vision_motion_hold = 1U;
@@ -1118,7 +1166,7 @@ static uint8_t Auto_CheckVision(uint32_t now)
       plan_dirty = 1U;
       Vision_SendMode('S', 0U);
       vision_retry_tick = now;
-      Motor_SendText("VISION LOST: WHEELS AND COLLECTOR STOPPED\r\n");
+      Motor_SendText("VISION LOST: WHEELS STOPPED, BRUSH CONTINUES\r\n");
     }
     else if ((uint32_t)(now - vision_retry_tick) >= AUTO_VISION_RETRY_MS)
     {
@@ -1196,7 +1244,6 @@ static void Auto_Update(void)
       break;
 
     case AUTO_SCAN:
-      motor3_forward(COLLECTOR_RUN_PWM);
       Motor_SetTarget(-AUTO_SCAN_SPEED_PERCENT, AUTO_SCAN_SPEED_PERCENT);
       if ((scan_accumulated_angle >= AUTO_SCAN_MIN_ROTATION_RAD) ||
           ((now - auto_state_start_tick) >= current_scan_timeout_ms))
@@ -1278,7 +1325,6 @@ static void Auto_Update(void)
         /* A fresh empty/mismatched frame is different from a lost link,
          * but it must not leave the previous drive command active. */
         Motor_Stop();
-        motor3_stop();
         if ((now - auto_state_start_tick) > AUTO_VISION_TIMEOUT_MS)
         {
           auto_state = AUTO_RECOVER;
@@ -1309,7 +1355,6 @@ static void Auto_Update(void)
     }
 
     case AUTO_COLLECT:
-      motor3_forward(COLLECTOR_RUN_PWM);
       Motor_SetTarget(AUTO_FINAL_SPEED_PERCENT, AUTO_FINAL_SPEED_PERCENT);
       if ((now - auto_state_start_tick) >= AUTO_COLLECT_DURATION_MS)
       {
@@ -1430,13 +1475,6 @@ void motor3_forward(uint16_t speed)
   __HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_3, speed);
 }
 
-static void motor3_reverse(uint16_t speed)
-{
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
-  __HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_3, speed);
-}
-
 /* 卸货(EJECT)阶段驱动 MG995 后舱门舵机持续运动帮助物块卸下。
  * 离开 EJECT 阶段自动回到中位；手动 G 测试模式下不被自动复位。 */
 static void Mission_ServoUpdate(MissionUnloadState_t unload_state,
@@ -1452,13 +1490,6 @@ static void Mission_ServoUpdate(MissionUnloadState_t unload_state,
   {
     Servo_Stop();
   }
-}
-
-void motor3_stop(void)
-{
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
-  __HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_3, 0);
 }
 
 /* PB0/PB1 were used by the third motor functions but were not configured by
@@ -1485,7 +1516,6 @@ static void Mission_UpdateIntegration(void)
   if (vision_motion_hold != 0U)
   {
     Motor_Stop();
-    motor3_stop();
     return;
   }
 
@@ -1527,22 +1557,10 @@ static void Mission_UpdateIntegration(void)
       (void)request_replan; /* GO_STAGE recomputes its local vector every loop. */
     }
     Motor_SetTarget(output.left_percent, output.right_percent);
-    if (output.collector_pwm < 0)
-    {
-      motor3_reverse((uint16_t)(-output.collector_pwm));
-    }
-    else if (output.collector_pwm > 0)
-    {
-      motor3_forward((uint16_t)output.collector_pwm);
-    }
-    else
-    {
-      motor3_stop();
-    }
+    /* Unloading owns the rear servo only; it must not change the front brush. */
     if (output.finished != 0U)
     {
       Motor_Stop();
-      motor3_stop();
       if (CombatStrategy_IsActive() != 0U)
       {
         CombatStrategy_RecordDeposit(now);
@@ -1739,10 +1757,13 @@ int main(void)
   Vision_SendMode('S', 0U);
   Motor_SendText("READY: A=TECH, C=COMBAT, F/B/L/R/S, X=RESET, M/P/V, G=SERVO\r\n");
 
-  //电机3初始化：只开启PWM外设，等有效视觉与扫描状态后再转动//
+  //前刷独立常转：初始化完成后正转，不受视觉/驾驶/卸货状态控制//
   CollectorDirection_Init();
-  HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_3);
-  motor3_stop();
+  if (HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  motor3_forward(COLLECTOR_RUN_PWM);
 
   //后舱门 MG995 舵机初始化：TIM1_CH1(PA8)，50Hz，回到中位//
   Servo_Init();

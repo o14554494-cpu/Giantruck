@@ -52,7 +52,8 @@ typedef struct
 {
   int16_t left_percent;
   int16_t right_percent;
-  int16_t collector_pwm; /* -1000..1000; negative reverses the intake roller. */
+  int16_t collector_pwm; /* Reserved, always 0. Rear servo handles unloading;
+                         * mission outputs do not control the front brush. */
   uint8_t active;
   uint8_t finished;
 } MissionDriveOutput_t;

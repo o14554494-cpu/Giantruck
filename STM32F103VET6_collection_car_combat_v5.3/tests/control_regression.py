@@ -36,7 +36,8 @@ names = ['Motor_ClampPercent', 'Motor_SetOne', 'Motor_Set', 'Motor_SetTarget',
          'Auto_StartScan', 'Auto_Start', 'Auto_Stop', 'Auto_CheckVision',
          'Auto_Update', 'Auto_BuildPlan', 'Auto_FindCurrentVisionTarget',
          'Auto_DriveTowardLocal', 'Mission_UpdateIntegration',
-         'motor3_forward', 'motor3_reverse', 'motor3_stop', 'Vision_ApplyFrame']
+         'motor3_forward', 'Vision_ApplyFrame', 'Mission_ServoUpdate',
+         'Motor_ProcessCommand', 'Motor_ApplyDriveCommand']
 functions = [function(name) for name in names]
 prefix = r'''
 #include <assert.h>
@@ -65,17 +66,30 @@ static GPIO_TypeDef pins_b, pins_c;
 #define TIM_CHANNEL_2 1
 #define TIM_CHANNEL_3 2
 #define __HAL_TIM_GET_AUTORELOAD(t) ((t)->arr)
-#define __HAL_TIM_SET_COMPARE(t,c,d) ((t)->ccr[c] = (d))
+#define __HAL_TIM_SET_COMPARE(t,c,d) FakeCompare(t,c,d)
+static unsigned brush_writes, brush_in1, brush_in2, servo_updates;
+static void FakeCompare(FakeTimer *timer, unsigned channel, unsigned duty)
+{
+  timer->ccr[channel] = duty;
+  if (timer == &htim8) brush_writes++;
+}
 static uint32_t clock_ms, mode_requests;
 static uint32_t HAL_GetTick(void) { return clock_ms; }
 static void HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, int value)
-{ (void)port; (void)pin; (void)value; }
+{
+  if (port == GPIOB && pin == GPIO_PIN_0) brush_in1 = value;
+  if (port == GPIOB && pin == GPIO_PIN_1) brush_in2 = value;
+}
 static void Vision_SendMode(char mode, uint8_t color)
 { (void)mode; (void)color; mode_requests++; }
 static void Motor_SendText(const char *text) { (void)text; }
 static void Buzzer_NotifyTargetFound(void) {}
-static void Mission_ServoUpdate(MissionUnloadState_t state, uint32_t now)
-{ (void)state; (void)now; }
+static void Servo_StartEject(void) {}
+static void Servo_Stop(void) {}
+static void Servo_Update(uint32_t now) { (void)now; servo_updates++; }
+static void Motor_SendStatus(void) {}
+static void Auto_SendMap(void) {}
+static void Auto_SendPlan(void) {}
 '''
 checks = r'''
 static void fresh(void)
@@ -83,6 +97,12 @@ static void fresh(void)
   VisionFrame_t frame = {0}; /* zero targets is still a valid heartbeat */
   frame.sequence = 1;
   Vision_ApplyFrame(&frame);
+}
+static void assert_brush_continues(void)
+{
+  assert(htim8.ccr[2] == COLLECTOR_RUN_PWM);
+  assert(brush_in1 == 1 && brush_in2 == 0);
+  assert(brush_writes == 0); /* no task state may rewrite brush PWM */
 }
 static void reset_test(void)
 {
@@ -101,7 +121,9 @@ static void reset_test(void)
   auto_state_start_tick = clock_ms;
   hc_distance_mm = 0;
   empty_plan_retry_count = 0;
-  motor3_stop();
+  motor3_forward(COLLECTOR_RUN_PWM); /* same command as firmware startup */
+  brush_writes = 0;
+  servo_updates = 0;
   Motor_Stop();
 }
 static void test_pwm(void)
@@ -121,12 +143,15 @@ static void test_pwm(void)
   assert(Motor_MapDrivePercent(18) < Motor_MapDrivePercent(35));
   Motor_SetTarget(1, -1);
   assert(left_pwm_percent == 60 && right_pwm_percent == -60);
-  assert(htim3.ccr[0] == 2160 && htim3.ccr[1] == 2160);
+  /* Supplied v6 applies an 80% boost on start; it uses ARR, not ARR+1.
+   * These checks describe the received wheel code, not a boost-timing fix. */
+  assert(htim3.ccr[0] == 2879 && htim3.ccr[1] == 2879);
+  clock_ms += MOTOR_BOOST_DURATION_MS + 1;
   Motor_SetTarget(100, 0);
-  assert(htim3.ccr[0] == 3600 && htim3.ccr[1] == 0);
+  assert(htim3.ccr[0] == 3599 && htim3.ccr[1] == 0);
   Motor_Stop();
   assert(htim3.ccr[0] == 0 && htim3.ccr[1] == 0);
-  puts("PASS: PWM zero, 60% floor, sign, scaling, saturation and timer CCR");
+  puts("PASS: logical PWM mapping and supplied v6 boost output smoke check");
 }
 static void test_loss_and_recovery(void)
 {
@@ -146,13 +171,12 @@ static void test_loss_and_recovery(void)
     current_target_id = stale;
     planned_route.count = 1;
     Motor_SetTarget(40, 40);
-    motor3_forward(COLLECTOR_RUN_PWM);
     clock_ms += AUTO_VISION_TIMEOUT_MS + 1;
     last_auto_update_tick = clock_ms; /* watchdog precedes scheduling gate */
     Auto_Update();
     assert(vision_motion_hold == 1);
     assert(left_pwm_percent == 0 && right_pwm_percent == 0);
-    assert(htim8.ccr[2] == 0);
+    assert_brush_continues();
     assert(current_target_id == 0 && planned_route.count == 0);
     assert(TargetMap_FindById(&target_map, stale) == NULL);
     assert(TargetMap_FindById(&target_map, kept)->collected != 0);
@@ -160,17 +184,19 @@ static void test_loss_and_recovery(void)
     /* Even an avoidance state already in STOP/TURN must not overwrite hold. */
     Mission_UpdateIntegration();
     assert(left_pwm_percent == 0 && right_pwm_percent == 0);
+    assert_brush_continues();
     clock_ms += 500;
     fresh();
     Auto_Update();
     assert(vision_motion_hold == 0 && auto_state == AUTO_SCAN);
-    assert(htim8.ccr[2] == COLLECTOR_RUN_PWM);
+    assert_brush_continues();
     assert(left_pwm_percent <= -60 && right_pwm_percent >= 60);
     assert(scan_accumulated_angle == 0);
   }
   reset_test();
   Auto_Start();
-  assert(htim8.ccr[2] == 0 && left_pwm_percent == 0);
+  assert_brush_continues();
+  assert(left_pwm_percent == 0);
   Auto_Update();
   assert(vision_motion_hold == 1 && left_pwm_percent == 0);
   clock_ms += 20;
@@ -184,7 +210,8 @@ static void test_loss_and_recovery(void)
   latest_vision_tick = UINT32_MAX - 500;
   assert(Auto_CheckVision(100) == 1);
   assert(Auto_CheckVision(1000) == 0);
-  puts("PASS: all collection states stop on stale/no frames, preserve payload, rescan on recovery");
+  assert_brush_continues();
+  puts("PASS: vision loss/recovery stops wheels, preserves payload and continuous brush");
 }
 static void test_missing_target(void)
 {
@@ -192,12 +219,11 @@ static void test_missing_target(void)
   fresh();
   auto_state = AUTO_FINAL_ALIGN;
   Motor_SetTarget(20, 20);
-  motor3_forward(COLLECTOR_RUN_PWM);
   Auto_Update();
   assert(vision_motion_hold == 0); /* fresh empty frame, not a link failure */
   assert(left_pwm_percent == 0 && right_pwm_percent == 0);
-  assert(htim8.ccr[2] == 0);
-  puts("PASS: fresh frame without aligned target stops immediately");
+  assert_brush_continues();
+  puts("PASS: missing target stops wheels without changing brush");
 }
 static void test_deposit_next_batch(void)
 {
@@ -210,27 +236,34 @@ static void test_deposit_next_batch(void)
   robot_pose.x_mm = MISSION_UNLOAD_STAGE_X_MM;
   robot_pose.y_mm = MISSION_UNLOAD_STAGE_Y_MM;
   Mission_UpdateIntegration(); /* GO_STAGE -> ALIGN */
+  assert_brush_continues();
   Mission_UpdateIntegration(); /* ALIGN -> REVERSE */
+  assert_brush_continues();
   robot_pose.x_mm = MISSION_UNLOAD_STOP_X_MM;
   Mission_UpdateIntegration(); /* REVERSE -> EJECT */
+  assert_brush_continues();
   assert(MissionExtension_GetUnloadState() == MISSION_UNLOAD_EJECT);
   Mission_UpdateIntegration();
-  assert(htim8.ccr[2] == 700);
+  assert_brush_continues();
+  assert(servo_updates > 0);
+  assert(MissionExtension_UpdateUnload(&robot_pose, 0, clock_ms).collector_pwm == 0);
   clock_ms += 5001; /* current mission module uses a 5000ms eject phase */
   Mission_UpdateIntegration(); /* DONE -> next scan */
-  assert(auto_state == AUTO_SCAN && htim8.ccr[2] == 0);
+  assert(auto_state == AUTO_SCAN);
+  assert_brush_continues();
   Auto_Update(); /* no frame: must not blindly restart */
-  assert(vision_motion_hold == 1 && htim8.ccr[2] == 0);
+  assert(vision_motion_hold == 1);
+  assert_brush_continues();
   clock_ms += 20;
   fresh();
   Auto_Update();
   assert(htim8.ccr[2] == COLLECTOR_RUN_PWM);
-  motor3_stop();
   auto_state = AUTO_COLLECT;
   auto_state_start_tick = clock_ms;
   clock_ms += 20; fresh(); Auto_Update();
   assert(htim8.ccr[2] == COLLECTOR_RUN_PWM);
-  puts("PASS: real unload state machine -> next batch collector restart; COLLECT also reasserts output");
+  assert_brush_continues();
+  puts("PASS: unload drives rear servo, brush stays forward through deposit and next batch");
 }
 static void test_scope_and_override(void)
 {
@@ -245,12 +278,33 @@ static void test_scope_and_override(void)
   clock_ms += 1000;
   Mission_UpdateIntegration();
   assert(left_pwm_percent == 0 && right_pwm_percent == 0);
+  assert_brush_continues();
   puts("PASS: manual unaffected; obstacle recovery cannot overwrite vision stop");
+}
+static void test_manual_and_fault(void)
+{
+  const char commands[] = "FBLRSXAC0G";
+  unsigned i;
+  reset_test();
+  for (i = 0; i < sizeof(commands)-1; ++i)
+  {
+    Motor_ProcessCommand(commands[i]);
+    assert_brush_continues();
+  }
+  reset_test();
+  MissionExtension_RecordCollected();
+  auto_state = AUTO_COMPLETE;
+  MissionExtension_StartUnload(clock_ms);
+  clock_ms += 20001;
+  Mission_UpdateIntegration(); /* stage timeout -> unload fault */
+  assert(MissionExtension_GetUnloadState() == MISSION_UNLOAD_FAULT);
+  assert_brush_continues();
+  puts("PASS: Bluetooth start/stop/reset and unload fault do not change front brush");
 }
 int main(void)
 {
   reset_test(); test_pwm(); test_loss_and_recovery(); test_missing_target();
-  test_deposit_next_batch(); test_scope_and_override();
+  test_deposit_next_batch(); test_scope_and_override(); test_manual_and_fault();
   puts("control regression tests passed");
   return 0;
 }
