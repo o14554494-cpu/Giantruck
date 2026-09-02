@@ -1,0 +1,6 @@
+# Local IDE/build artifacts
+**/Debug/
+**/Release/
+**/build/
+**/.DS_Store
+collection_car_combat_v5.3_scan_buzzer.zip
