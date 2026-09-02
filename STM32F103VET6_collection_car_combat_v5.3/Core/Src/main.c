@@ -33,6 +33,7 @@
 #include "mission_extension.h"
 #include "combat_strategy.h"
 #include "servo.h"
+#include "drive_pwm.h"
 
 /* USER CODE END Includes */
 
@@ -106,6 +107,8 @@ typedef enum
 #define AUTO_COLLECT_DURATION_MS           900U
 #define AUTO_RECOVER_DURATION_MS           900U
 #define AUTO_VISION_TIMEOUT_MS             1200U
+#define AUTO_VISION_RETRY_MS               500U
+#define COLLECTOR_RUN_PWM                  500U
 #define AUTO_REPLAN_PERIOD_MS              700U
 #define AUTO_EMPTY_RESCAN_LIMIT             1U
 #define AUTO_EMPTY_RESCAN_TIMEOUT_MS        3000U
@@ -186,6 +189,8 @@ static uint32_t auto_state_start_tick;
 static uint32_t last_plan_tick;
 static uint32_t current_scan_timeout_ms;
 static uint32_t accepted_vision_frame_count;
+static uint8_t vision_motion_hold;
+static uint32_t vision_retry_tick;
 static float scan_accumulated_angle;
 static uint16_t current_target_id;
 static uint8_t plan_dirty;
@@ -249,6 +254,9 @@ static const char *Auto_StateName(AutoState_t state);
 static void Mission_UpdateIntegration(void);
 static void CollectorDirection_Init(void);
 static void motor3_reverse(uint16_t speed);
+void motor3_forward(uint16_t speed);
+void motor3_stop(void);
+static uint8_t Auto_CheckVision(uint32_t now);
 static void Mission_ServoUpdate(MissionUnloadState_t unload_state,
                                 uint32_t now_ms);
 
@@ -402,14 +410,17 @@ static void Motor_SetOne(GPIO_TypeDef *in1_port, uint16_t in1_pin,
   }
 
   period = __HAL_TIM_GET_AUTORELOAD(&htim3);
-  duty = ((uint32_t)magnitude * period) / 100U;
+  /* PWM period is ARR+1 ticks; round up so a requested 60% is not 59.98%. */
+  duty = ((uint32_t)magnitude * (period + 1U) + 99U) / 100U;
   __HAL_TIM_SET_COMPARE(&htim3, channel, duty);
 }
 
 static void Motor_Set(int16_t left_speed, int16_t right_speed)
 {
-  left_speed = Motor_ClampPercent(left_speed);
-  right_speed = Motor_ClampPercent(right_speed);
+  /* Apply the hardware dead-zone mapping once, at the final wheel output.
+   * Targets remain logical commands; PWM telemetry reports actual duty. */
+  left_speed = Motor_MapDrivePercent(left_speed);
+  right_speed = Motor_MapDrivePercent(right_speed);
 
   Motor_SetOne(MOTOR_LEFT_IN1_PORT, MOTOR_LEFT_IN1_PIN,
                MOTOR_LEFT_IN2_PORT, MOTOR_LEFT_IN2_PIN,
@@ -678,13 +689,13 @@ static void Motor_SendStatus(void)
 {
   char status[256];
   uint32_t now = HAL_GetTick();
-  uint32_t vision_age_ms = latest_vision_tick == 0U ? 0xFFFFFFFFUL :
+  uint32_t vision_age_ms = accepted_vision_frame_count == 0U ? 0xFFFFFFFFUL :
                            now - latest_vision_tick;
 
   (void)snprintf(status, sizeof(status),
                  "RPM L=%ld R=%ld PWM L=%d R=%d PID=%s AUTO=%s "
                  "POSE=%ld,%ld,%ld MAP=%u VSEQ=%u VAGE=%lu "
-                 "VFRAMES=%lu RXERR=%lu\r\n",
+                 "VFRAMES=%lu RXERR=%lu VHOLD=%u\r\n",
                  (long)left_speed_rpm, (long)right_speed_rpm,
                  (int)left_pwm_percent, (int)right_pwm_percent,
 #if MOTOR_CLOSED_LOOP_ENABLE == 1U
@@ -699,7 +710,8 @@ static void Motor_SendStatus(void)
                  (unsigned int)latest_vision_frame.sequence,
                  (unsigned long)vision_age_ms,
                  (unsigned long)accepted_vision_frame_count,
-                 (unsigned long)VisionProtocol_GetErrorCount());
+                 (unsigned long)VisionProtocol_GetErrorCount(),
+                 (unsigned int)vision_motion_hold);
   Motor_SendText(status);
   (void)snprintf(status, sizeof(status),
                  "UNLOAD=%s PAYLOAD=%u SERVO=%s FRONT=%lu mm\r\n",
@@ -833,7 +845,10 @@ static void Auto_StartScan(uint32_t timeout_ms)
   auto_state = AUTO_SCAN;
   auto_state_start_tick = HAL_GetTick();
   Vision_SendMode('S', 0U);
-  Motor_SetTarget(-AUTO_SCAN_SPEED_PERCENT, AUTO_SCAN_SPEED_PERCENT);
+  /* The next Auto_Update must pass the vision gate before any movement.
+   * This also covers the next combat batch after unloading stopped motor 3. */
+  Motor_Stop();
+  motor3_stop();
 }
 
 static void Auto_Start(void)
@@ -848,6 +863,8 @@ static void Auto_Start(void)
 
   latest_vision_tick = 0U;
   accepted_vision_frame_count = 0U;
+  vision_motion_hold = 0U;
+  vision_retry_tick = 0U;
   current_target_id = 0U;
   plan_dirty = 0U;
   empty_plan_retry_count = 0U;
@@ -859,6 +876,7 @@ static void Auto_Start(void)
 
 static void Auto_Stop(uint8_t clear_map)
 {
+  vision_motion_hold = 0U;
   auto_state = AUTO_IDLE;
   current_target_id = 0U;
   plan_dirty = 0U;
@@ -1070,9 +1088,62 @@ static void Auto_DriveTowardLocal(float forward_mm, float left_mm,
                   (int16_t)(base_speed + turn));
 }
 
+/* Loss of complete, checksum-validated frames holds autonomous collection.
+ * Manual control and an already-started odometry-based unload are separate.
+ * On recovery rescan instead of resuming a partly completed pickup. */
+static uint8_t Auto_CheckVision(uint32_t now)
+{
+  uint8_t index;
+  if ((auto_state == AUTO_IDLE) || (auto_state == AUTO_COMPLETE))
+  {
+    vision_motion_hold = 0U;
+    return 1U;
+  }
+  if ((accepted_vision_frame_count == 0U) ||
+      ((uint32_t)(now - latest_vision_tick) > AUTO_VISION_TIMEOUT_MS))
+  {
+    Motor_Stop();
+    motor3_stop();
+    if (vision_motion_hold == 0U)
+    {
+      vision_motion_hold = 1U;
+      current_target_id = 0U;
+      memset(&planned_route, 0, sizeof(planned_route));
+      /* Keep already-collected history and payload, discard stale candidates. */
+      for (index = 0U; index < TARGET_MAP_MAX_TARGETS; index++)
+      {
+        if (target_map.targets[index].collected == 0U)
+          target_map.targets[index].valid = 0U;
+      }
+      plan_dirty = 1U;
+      Vision_SendMode('S', 0U);
+      vision_retry_tick = now;
+      Motor_SendText("VISION LOST: WHEELS AND COLLECTOR STOPPED\r\n");
+    }
+    else if ((uint32_t)(now - vision_retry_tick) >= AUTO_VISION_RETRY_MS)
+    {
+      vision_retry_tick = now;
+      Vision_SendMode('S', 0U);
+    }
+    return 0U;
+  }
+  if (vision_motion_hold != 0U)
+  {
+    vision_motion_hold = 0U;
+    empty_plan_retry_count = 0U;
+    Auto_StartScan(CombatStrategy_IsActive() != 0U ? 3000U :
+                                                    AUTO_SCAN_TIMEOUT_MS);
+    Motor_SendText("VISION RESTORED: RESCAN BEFORE COLLECTING\r\n");
+  }
+  return 1U;
+}
+
 static void Auto_Update(void)
 {
   uint32_t now = HAL_GetTick();
+
+  /* Run before the 20ms scheduling gate so a stale link cannot keep driving. */
+  if (Auto_CheckVision(now) == 0U) return;
 
   if ((now - last_auto_update_tick) < AUTO_UPDATE_PERIOD_MS)
   {
@@ -1125,6 +1196,7 @@ static void Auto_Update(void)
       break;
 
     case AUTO_SCAN:
+      motor3_forward(COLLECTOR_RUN_PWM);
       Motor_SetTarget(-AUTO_SCAN_SPEED_PERCENT, AUTO_SCAN_SPEED_PERCENT);
       if ((scan_accumulated_angle >= AUTO_SCAN_MIN_ROTATION_RAD) ||
           ((now - auto_state_start_tick) >= current_scan_timeout_ms))
@@ -1203,6 +1275,10 @@ static void Auto_Update(void)
 
       if (observation == NULL)
       {
+        /* A fresh empty/mismatched frame is different from a lost link,
+         * but it must not leave the previous drive command active. */
+        Motor_Stop();
+        motor3_stop();
         if ((now - auto_state_start_tick) > AUTO_VISION_TIMEOUT_MS)
         {
           auto_state = AUTO_RECOVER;
@@ -1233,6 +1309,7 @@ static void Auto_Update(void)
     }
 
     case AUTO_COLLECT:
+      motor3_forward(COLLECTOR_RUN_PWM);
       Motor_SetTarget(AUTO_FINAL_SPEED_PERCENT, AUTO_FINAL_SPEED_PERCENT);
       if ((now - auto_state_start_tick) >= AUTO_COLLECT_DURATION_MS)
       {
@@ -1403,6 +1480,14 @@ static void Mission_UpdateIntegration(void)
 {
   uint32_t now = HAL_GetTick();
   MissionUnloadState_t unload_state = MissionExtension_GetUnloadState();
+
+  /* Do not let the reactive avoidance state overwrite the vision hold. */
+  if (vision_motion_hold != 0U)
+  {
+    Motor_Stop();
+    motor3_stop();
+    return;
+  }
 
   /* 舵机只在 EJECT 阶段持续运动，其余状态保持中位 */
   Mission_ServoUpdate(unload_state, now);
@@ -1654,10 +1739,10 @@ int main(void)
   Vision_SendMode('S', 0U);
   Motor_SendText("READY: A=TECH, C=COMBAT, F/B/L/R/S, X=RESET, M/P/V, G=SERVO\r\n");
 
-  //电机3初始化：启动PWM，半速正转（此处调速）//
+  //电机3初始化：只开启PWM外设，等有效视觉与扫描状态后再转动//
   CollectorDirection_Init();
   HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_3);
-  motor3_forward(500);  // 500 = 半速（范围0~1000）
+  motor3_stop();
 
   //后舱门 MG995 舵机初始化：TIM1_CH1(PA8)，50Hz，回到中位//
   Servo_Init();

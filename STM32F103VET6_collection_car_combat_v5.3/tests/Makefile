@@ -1,4 +1,5 @@
 CC ?= cc
+PYTHON ?= python3
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -O2
 
 BUILD_DIR := build
@@ -24,6 +25,7 @@ $(TEST_BIN): $(BUILD_DIR) $(SOURCES)
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)
+	$(PYTHON) control_regression.py
 
 clean:
 	rm -rf $(BUILD_DIR)
