@@ -56,8 +56,18 @@ typedef enum
   AUTO_RECOVER,
   AUTO_COMBAT_PATROL,
   AUTO_COMPLETE,
-  AUTO_DEBUG
+  AUTO_DEBUG,
+  AUTO_UNJAM
 } AutoState_t;
+
+typedef enum
+{
+  COLLECTOR_IDLE = 0,
+  COLLECTOR_STOPPING,
+  COLLECTOR_REVERSING,
+  COLLECTOR_SETTLING,
+  COLLECTOR_HOLD
+} CollectorRecoveryState_t;
 
 /* USER CODE END PTD */
 
@@ -114,9 +124,25 @@ typedef enum
 #define DEBUG_TURN_PERCENT                18
 #define VISION_REPORT_PERIOD_MS            500U
 #define BLUETOOTH_QUEUE_SIZE               32U
-/* Independent front brush: runs continuously after peripheral startup.
+/* Independent front brush: normally runs continuously after startup;
+ * an explicit J recovery or its interrupted HOLD is the only exception.
  * Raw TIM8 compare value, 0..1000; 500 = 50% duty. */
 #define COLLECTOR_RUN_PWM                  500U
+/* No brush encoder/current input is wired. J is an operator request;
+ * two output-shaft turns are ESTIMATED from a calibrated reverse RPM. */
+#define COLLECTOR_REVERSE_PWM              500U
+#define COLLECTOR_REVERSE_TURNS            2U
+#define COLLECTOR_REVERSE_RPM_ESTIMATE      60U
+#define COLLECTOR_REVERSE_DURATION_MS      (60000U * COLLECTOR_REVERSE_TURNS / COLLECTOR_REVERSE_RPM_ESTIMATE)
+#define COLLECTOR_DIRECTION_PAUSE_MS       150U
+#define COLLECTOR_BACKUP_DISTANCE_MM       80.0f
+#define COLLECTOR_BACKUP_TIMEOUT_MS        600U
+#define COLLECTOR_BACKUP_PERCENT           15
+#if COLLECTOR_REVERSE_RPM_ESTIMATE == 0
+#error "Calibrated brush RPM must be positive"
+#elif COLLECTOR_REVERSE_DURATION_MS < 100 || COLLECTOR_REVERSE_DURATION_MS > 6000
+#error "Brush reversal duration must be between 100 and 6000 ms"
+#endif
 #define AUTO_REPLAN_PERIOD_MS              700U
 #define AUTO_EMPTY_RESCAN_LIMIT             1U
 #define AUTO_EMPTY_RESCAN_TIMEOUT_MS        3000U
@@ -225,6 +251,13 @@ static uint8_t hc_close_count;
 /* 蓝牙 G 命令手动测试舵机时置 1，测试结束或进入自动卸货后清 0 */
 static uint8_t servo_test_active;
 
+static CollectorRecoveryState_t collector_recovery_state = COLLECTOR_IDLE;
+static AutoState_t collector_resume_state = AUTO_IDLE;
+static uint32_t collector_phase_tick;
+static float collector_left_travel_mm;
+static float collector_right_travel_mm;
+static uint8_t collector_backup_done;
+
 /* 电机启动补偿状态（每个通道独立） */
 static int16_t  ch1_last_target = 0;       /* CH1上一次的目标占空比 */
 static int16_t  ch2_last_target = 0;       /* CH2上一次的目标占空比 */
@@ -277,6 +310,15 @@ static const char *Auto_StateName(AutoState_t state);
 static void Mission_UpdateIntegration(void);
 static void CollectorDirection_Init(void);
 void motor3_forward(uint16_t speed);
+static void motor3_stop(void);
+static void motor3_reverse(uint16_t speed);
+static void CollectorRecovery_Start(void);
+static void CollectorRecovery_Update(void);
+static void CollectorRecovery_Abort(void);
+static void CollectorRecovery_Restore(void);
+static void CollectorRecovery_RecordTravel(float left_mm, float right_mm);
+static void CollectorRecovery_SendStatus(void);
+static const char *CollectorRecovery_StateName(void);
 static uint8_t Auto_CheckVision(uint32_t now);
 static void Mission_ServoUpdate(MissionUnloadState_t unload_state,
                                 uint32_t now_ms);
@@ -378,6 +420,7 @@ static const char *Auto_StateName(AutoState_t state)
     case AUTO_COMBAT_PATROL:return "PATROL";
     case AUTO_COMPLETE:    return "COMPLETE";
     case AUTO_DEBUG:       return "DEBUG";
+    case AUTO_UNJAM:       return "UNJAM";
     default:               return "UNKNOWN";
   }
 }
@@ -661,6 +704,25 @@ static void Motor_ProcessCommand(uint8_t command)
     command = (uint8_t)(command - ('a' - 'A'));
   }
 
+  /* The recovery owns both wheel and brush outputs. A queued drive/mode
+   * command cannot override it; stopping explicitly cancels all resumption. */
+  if (collector_recovery_state != COLLECTOR_IDLE)
+  {
+    if (command == 'S' || command == 'X' || command == '0')
+      CollectorRecovery_Abort();
+    else if (command == 'V')
+    {
+      CollectorRecovery_SendStatus();
+      return;
+    }
+    else if (command != 'J' && command != 'K' &&
+             command != '\r' && command != '\n')
+    {
+      Motor_SendText("UNJAM BUSY: S=ABORT, J=RETRY IN HOLD, K=RESTORE IN HOLD\r\n");
+      return;
+    }
+  }
+
   if ((command >= '0') && (command <= '9'))
   {
     motor_speed_percent = (uint8_t)(command - '0') * 10U;
@@ -719,6 +781,14 @@ static void Motor_ProcessCommand(uint8_t command)
     case 'D':
       Debug_Start();
       Motor_SendText("MODE=DEBUG: ONE FRAME FOLLOW, NO MAP/QUALITY GATE\r\n");
+      break;
+
+    case 'J':
+      CollectorRecovery_Start();
+      break;
+
+    case 'K':
+      CollectorRecovery_Restore();
       break;
 
     case 'X':
@@ -801,6 +871,7 @@ static void Motor_SendStatus(void)
                  (unsigned long)VisionProtocol_GetErrorCount(),
                  (unsigned int)vision_motion_hold);
   Motor_SendText(status);
+  CollectorRecovery_SendStatus();
   (void)snprintf(status, sizeof(status),
                  "UNLOAD=%s PAYLOAD=%u SERVO=%s FRONT=%lu mm BRUSH=CONT PWM=%u/1000\r\n",
                  MissionExtension_UnloadStateName(),
@@ -824,6 +895,8 @@ static void Motor_SendStatus(void)
 
 static const char *Robot_ModeName(void)
 {
+  if (collector_recovery_state == COLLECTOR_HOLD) return "JAM_HOLD";
+  if (collector_recovery_state != COLLECTOR_IDLE) return "UNJAM";
   if (auto_state == AUTO_DEBUG) return "DEBUG";
   if (CombatStrategy_IsActive() != 0U) return "COMBAT";
   if (auto_state == AUTO_IDLE) return "MANUAL";
@@ -832,6 +905,9 @@ static const char *Robot_ModeName(void)
 
 static void Vision_ReportTelemetry(uint8_t force)
 {
+  /* Avoid multi-line blocking UART reports while controlling short backup.
+   * J transition reports and V's short recovery status remain available. */
+  if (collector_recovery_state != COLLECTOR_IDLE) return;
   char line[176];
   uint8_t index;
   uint32_t now = HAL_GetTick();
@@ -882,6 +958,8 @@ static void Robot_UpdateOdometry(int32_t left_delta, int32_t right_delta)
   float heading_change = (right_distance - left_distance) / WHEEL_TRACK_MM;
   float midpoint_heading = robot_pose.heading_rad + heading_change * 0.5f;
 
+  CollectorRecovery_RecordTravel(left_distance, right_distance);
+
   robot_pose.x_mm += centre_distance * Planner_Cos(midpoint_heading);
   robot_pose.y_mm += centre_distance * Planner_Sin(midpoint_heading);
   robot_pose.heading_rad = Planner_NormalizeAngle(
@@ -923,6 +1001,7 @@ static void Vision_ApplyFrame(const VisionFrame_t *frame)
   latest_vision_frame = *frame;
   latest_vision_tick = now;
   accepted_vision_frame_count++;
+  if (collector_recovery_state != COLLECTOR_IDLE) return;
   heading_cos = Planner_Cos(robot_pose.heading_rad);
   heading_sin = Planner_Sin(robot_pose.heading_rad);
 
@@ -1382,6 +1461,8 @@ static void Auto_Update(void)
 {
   uint32_t now = HAL_GetTick();
 
+  if (collector_recovery_state != COLLECTOR_IDLE) return;
+
   if (auto_state == AUTO_DEBUG)
   {
     /* Dedicated visual servo loop; never enter the planner or auto pickup. */
@@ -1673,6 +1754,195 @@ void motor3_forward(uint16_t speed)
   __HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_3, speed);
 }
 
+static void motor3_stop(void)
+{
+  __HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_3, 0U);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+}
+
+static void motor3_reverse(uint16_t speed)
+{
+  /* Called only after zero PWM and the direction-change pause. */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+  __HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_3, speed);
+}
+
+static const char *CollectorRecovery_StateName(void)
+{
+  switch (collector_recovery_state)
+  {
+    case COLLECTOR_STOPPING:  return "STOPPING";
+    case COLLECTOR_REVERSING: return "REVERSING";
+    case COLLECTOR_SETTLING:  return "SETTLING";
+    case COLLECTOR_HOLD:      return "HOLD";
+    default:                 return "IDLE";
+  }
+}
+
+static void CollectorRecovery_SendStatus(void)
+{
+  char line[192];
+  const char *brush = collector_recovery_state == COLLECTOR_IDLE ? "FORWARD" :
+      (collector_recovery_state == COLLECTOR_REVERSING ? "REVERSE" : "STOP");
+  (void)snprintf(line, sizeof(line),
+      "UNJAM=%s BRUSH=%s BACK_L=%ld BACK_R=%ld mm BACK_STOP=%u REV_MS=%lu EST_TURNS=%u\r\n",
+      CollectorRecovery_StateName(), brush, (long)collector_left_travel_mm,
+      (long)collector_right_travel_mm, (unsigned int)collector_backup_done,
+      (unsigned long)COLLECTOR_REVERSE_DURATION_MS,
+      (unsigned int)COLLECTOR_REVERSE_TURNS);
+  Motor_SendText(line);
+}
+
+static void CollectorRecovery_Start(void)
+{
+  MissionUnloadState_t unload_state = MissionExtension_GetUnloadState();
+  if (collector_recovery_state != COLLECTOR_IDLE &&
+      collector_recovery_state != COLLECTOR_HOLD)
+  {
+    Motor_SendText("UNJAM BUSY: REQUEST NOT RESTARTED\r\n");
+    return;
+  }
+  if (servo_test_active != 0U ||
+      (auto_state == AUTO_COMPLETE && MissionExtension_HasPayload() != 0U) ||
+      (unload_state != MISSION_UNLOAD_IDLE && unload_state != MISSION_UNLOAD_DONE))
+  {
+    Motor_SendText("UNJAM REJECTED: STOP UNLOADING/SERVO TEST FIRST\r\n");
+    return;
+  }
+  collector_resume_state = auto_state;
+  Motor_Stop();
+  motor3_stop();
+  MissionExtension_CancelMotion();
+  current_target_id = 0U;
+  memset(&planned_route, 0, sizeof(planned_route));
+  auto_state = AUTO_UNJAM;
+  collector_left_travel_mm = collector_right_travel_mm = 0.0f;
+  collector_backup_done = 0U;
+  collector_recovery_state = COLLECTOR_STOPPING;
+  collector_phase_tick = HAL_GetTick();
+  Motor_SendText("UNJAM START: TIMED BRUSH REVERSE, ENCODER/TIME LIMITED BACKUP\r\n");
+}
+
+static void CollectorRecovery_RecordTravel(float left_mm, float right_mm)
+{
+  if (collector_recovery_state == COLLECTOR_REVERSING && collector_backup_done == 0U)
+  {
+    /* Stop when EITHER wheel reaches the cap, including an encoder polarity
+     * mismatch or a one-wheel stall. Wheel travel is not ground displacement. */
+    collector_left_travel_mm += Robot_AbsFloat(left_mm);
+    collector_right_travel_mm += Robot_AbsFloat(right_mm);
+  }
+}
+
+static void CollectorRecovery_Abort(void)
+{
+  Motor_Stop();
+  motor3_stop();
+  Auto_Stop(0U);
+  CombatStrategy_Stop();
+  collector_resume_state = AUTO_IDLE;
+  collector_backup_done = 1U;
+  collector_recovery_state = COLLECTOR_HOLD;
+  collector_phase_tick = HAL_GetTick();
+  Motor_SendText("UNJAM ABORTED: WHEELS/BRUSH STOPPED; J=RETRY, K=RESTORE BRUSH\r\n");
+}
+
+static void CollectorRecovery_Restore(void)
+{
+  if (collector_recovery_state != COLLECTOR_HOLD)
+  {
+    Motor_SendText("K REQUIRES UNJAM HOLD\r\n");
+    return;
+  }
+  Motor_Stop();
+  motor3_stop();
+  collector_resume_state = AUTO_IDLE;
+  collector_recovery_state = COLLECTOR_SETTLING;
+  collector_phase_tick = HAL_GetTick();
+  Motor_SendText("UNJAM RESTORE: WAIT BEFORE FORWARD\r\n");
+}
+
+static void CollectorRecovery_Update(void)
+{
+  uint32_t now = HAL_GetTick();
+  uint32_t elapsed = now - collector_phase_tick;
+  uint8_t index;
+  switch (collector_recovery_state)
+  {
+    case COLLECTOR_STOPPING:
+      if (elapsed < COLLECTOR_DIRECTION_PAUSE_MS) return;
+      collector_recovery_state = COLLECTOR_REVERSING;
+      collector_phase_tick = now;
+      motor3_reverse(COLLECTOR_REVERSE_PWM);
+      Motor_SetTarget(-COLLECTOR_BACKUP_PERCENT, -COLLECTOR_BACKUP_PERCENT);
+      Motor_SendText("UNJAM REVERSING\r\n");
+      return;
+
+    case COLLECTOR_REVERSING:
+      if (elapsed >= COLLECTOR_REVERSE_DURATION_MS)
+      {
+        Motor_Stop();
+        motor3_stop();
+        collector_backup_done = 1U;
+        collector_recovery_state = COLLECTOR_SETTLING;
+        collector_phase_tick = now;
+        Motor_SendText("UNJAM SETTLING\r\n");
+        return;
+      }
+      if (collector_backup_done == 0U)
+      {
+        uint8_t distance_limit = collector_left_travel_mm >= COLLECTOR_BACKUP_DISTANCE_MM ||
+                                collector_right_travel_mm >= COLLECTOR_BACKUP_DISTANCE_MM;
+        if (distance_limit != 0U || elapsed >= COLLECTOR_BACKUP_TIMEOUT_MS)
+        {
+          Motor_Stop();
+          collector_backup_done = 1U;
+          Motor_SendText(distance_limit != 0U ? "UNJAM BACKUP STOP: WHEEL DISTANCE\r\n" :
+                                               "UNJAM BACKUP STOP: TIME LIMIT\r\n");
+        }
+        else
+          Motor_SetTarget(-COLLECTOR_BACKUP_PERCENT, -COLLECTOR_BACKUP_PERCENT);
+      }
+      return;
+
+    case COLLECTOR_SETTLING:
+      if (elapsed < COLLECTOR_DIRECTION_PAUSE_MS) return;
+      Motor_Stop();
+      motor3_forward(COLLECTOR_RUN_PWM);
+      collector_recovery_state = COLLECTOR_IDLE;
+      /* Reverse motion may have displaced targets. Preserve odometry and
+       * collected inventory, but require a NEW frame before autonomous motion. */
+      for (index = 0U; index < TARGET_MAP_MAX_TARGETS; index++)
+        if (target_map.targets[index].collected == 0U) target_map.targets[index].valid = 0U;
+      memset(&latest_vision_frame, 0, sizeof(latest_vision_frame));
+      latest_vision_tick = 0U;
+      accepted_vision_frame_count = 0U;
+      vision_motion_hold = 0U;
+      vision_report_due = 1U;
+      plan_dirty = 1U;
+      if (collector_resume_state == AUTO_DEBUG)
+      {
+        auto_state = AUTO_DEBUG;
+        debug_action = "WAIT_FRAME";
+        debug_target_index = -1;
+        Vision_SendMode('S', 0U);
+      }
+      else if (collector_resume_state != AUTO_IDLE && collector_resume_state != AUTO_COMPLETE)
+        Auto_StartScan(CombatStrategy_IsActive() != 0U ? 3000U : AUTO_SCAN_TIMEOUT_MS);
+      else
+        auto_state = collector_resume_state;
+      Motor_SendText("UNJAM CYCLE DONE: BRUSH FORWARD; JAM CLEARANCE NOT SENSED\r\n");
+      return;
+
+    case COLLECTOR_HOLD:
+    case COLLECTOR_IDLE:
+    default:
+      return;
+  }
+}
+
 /* 卸货(EJECT)阶段驱动 MG995 后舱门舵机持续运动帮助物块卸下。
  * 离开 EJECT 阶段自动回到中位；手动 G 测试模式下不被自动复位。 */
 static void Mission_ServoUpdate(MissionUnloadState_t unload_state,
@@ -1709,6 +1979,8 @@ static void Mission_UpdateIntegration(void)
 {
   uint32_t now = HAL_GetTick();
   MissionUnloadState_t unload_state = MissionExtension_GetUnloadState();
+
+  if (collector_recovery_state != COLLECTOR_IDLE) return;
 
   /* Debug has its own stop-only proximity check and no map-wall avoidance. */
   if (auto_state == AUTO_DEBUG) return;
@@ -1955,9 +2227,9 @@ int main(void)
   Motor_Stop();
   Buzzer_Init();
   Vision_SendMode('S', 0U);
-  Motor_SendText("READY FW=v6.1: A=TECH, C=COMBAT, D=DEBUG, S=STOP, X=RESET, F/B/L/R, M/P/V, G=SERVO\r\n");
+  Motor_SendText("READY FW=v6.1+UNJAM: A=TECH, C=COMBAT, D=DEBUG, J=UNJAM, K=BRUSH_RESTORE, S=STOP, X=RESET, F/B/L/R, M/P/V, G=SERVO\r\n");
 
-  //前刷独立常转：初始化完成后正转，不受视觉/驾驶/卸货状态控制//
+  //前刷默认正转；J 解卡及其中断 HOLD 可以反转/停刷//
   CollectorDirection_Init();
   if (HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_3) != HAL_OK)
   {
@@ -1989,6 +2261,7 @@ int main(void)
       Motor_ControlUpdate();
     }
 
+    CollectorRecovery_Update();
     Auto_Update();
     Mission_UpdateIntegration();
     Vision_ReportTelemetry(0U);
@@ -2016,7 +2289,8 @@ int main(void)
       Motor_SendText("COMMAND TIMEOUT - MOTOR STOPPED\r\n");
     }
     /* HC-SR04 每 100ms 测一次;正在倒车且连续两次小于阈值 → 停车 */
-        if ((HAL_GetTick() - hc_last_sample_tick) >= HC_SAMPLE_MS)
+        if ((collector_recovery_state == COLLECTOR_IDLE) &&
+            ((HAL_GetTick() - hc_last_sample_tick) >= HC_SAMPLE_MS))
         {
           hc_last_sample_tick = HAL_GetTick();
           hc_distance_mm = HCSR04_Measure();

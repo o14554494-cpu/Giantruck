@@ -40,7 +40,11 @@ names = ['Motor_ClampPercent', 'Motor_SetOne', 'Motor_Set', 'Motor_SetTarget',
          'Motor_ProcessCommand', 'Motor_ApplyDriveCommand', 'Debug_Start',
          'Debug_Update', 'Vision_ReportTelemetry', 'Robot_ModeName',
          'Bluetooth_QueueFromISR', 'Bluetooth_GetCommand', 'Bluetooth_ProcessPending',
-         'Vision_ProcessIncoming']
+         'Vision_ProcessIncoming', 'Robot_UpdateOdometry',
+         'motor3_stop', 'motor3_reverse', 'CollectorRecovery_Start',
+         'CollectorRecovery_Update', 'CollectorRecovery_Abort',
+         'CollectorRecovery_Restore', 'CollectorRecovery_RecordTravel',
+         'CollectorRecovery_StateName', 'CollectorRecovery_SendStatus']
 functions = [function(name) for name in names]
 prefix = r'''
 #include <assert.h>
@@ -84,6 +88,11 @@ static void __set_PRIMASK(unsigned mask) { test_irq_mask = mask; }
 static uint32_t HAL_GetTick(void) { return clock_ms; }
 static void HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, int value)
 {
+  /* Changing H-bridge direction must happen with PWM already at zero. */
+  if (port == GPIOB && pin == GPIO_PIN_0 && brush_in1 != (unsigned)value)
+    assert(htim8.ccr[2] == 0);
+  if (port == GPIOB && pin == GPIO_PIN_1 && brush_in2 != (unsigned)value)
+    assert(htim8.ccr[2] == 0);
   if (port == GPIOB && pin == GPIO_PIN_0) brush_in1 = value;
   if (port == GPIOB && pin == GPIO_PIN_1) brush_in2 = value;
 }
@@ -118,6 +127,13 @@ static void assert_brush_continues(void)
 static void reset_test(void)
 {
   clock_ms = 100;
+  collector_recovery_state = COLLECTOR_IDLE;
+  collector_resume_state = AUTO_IDLE;
+  collector_phase_tick = 0;
+  collector_left_travel_mm = collector_right_travel_mm = 0;
+  collector_backup_done = 0;
+  servo_test_active = 0;
+  htim8.ccr[2] = brush_in1 = brush_in2 = 0;
   CombatStrategy_Reset();
   MissionExtension_Reset();
   TargetMap_Reset(&target_map);
@@ -498,12 +514,191 @@ static void test_vision_telemetry(void)
   assert(test_log[0] == '\0'); /* periodic output is rate limited */
   puts("PASS: actual UART parser to telemetry: raw Q, filter causes, confirmations, no-frame/empty/stale distinction");
 }
+static void assert_recovery_stopped(void)
+{
+  assert(left_target_percent == 0 && right_target_percent == 0);
+  assert(htim3.ccr[0] == 0 && htim3.ccr[1] == 0);
+  assert(htim8.ccr[2] == 0 && brush_in1 == 0 && brush_in2 == 0);
+}
+static void enter_recovery_reverse(void)
+{
+  Motor_ProcessCommand('J');
+  assert(collector_recovery_state == COLLECTOR_STOPPING);
+  assert_recovery_stopped();
+  clock_ms += COLLECTOR_DIRECTION_PAUSE_MS - 1;
+  CollectorRecovery_Update(); assert_recovery_stopped();
+  clock_ms++;
+  CollectorRecovery_Update();
+  assert(collector_recovery_state == COLLECTOR_REVERSING);
+  assert(brush_in1 == 0 && brush_in2 == 1 && htim8.ccr[2] == COLLECTOR_REVERSE_PWM);
+  assert(left_target_percent < 0 && right_target_percent < 0);
+}
+static void finish_recovery(void)
+{
+  clock_ms = collector_phase_tick + COLLECTOR_REVERSE_DURATION_MS;
+  CollectorRecovery_Update();
+  assert(collector_recovery_state == COLLECTOR_SETTLING);
+  assert_recovery_stopped();
+  clock_ms += COLLECTOR_DIRECTION_PAUSE_MS - 1;
+  CollectorRecovery_Update(); assert_recovery_stopped();
+  clock_ms++;
+  CollectorRecovery_Update();
+  assert(collector_recovery_state == COLLECTOR_IDLE);
+  assert(htim8.ccr[2] == COLLECTOR_RUN_PWM && brush_in1 == 1 && brush_in2 == 0);
+  assert(left_target_percent == 0 && right_target_percent == 0);
+}
+static void test_recovery_distance_and_time(void)
+{
+  uint32_t phase;
+  const char blocked[] = "FACDGBLR9?";
+  unsigned i;
+  reset_test();
+  Motor_ProcessCommand('F');
+  enter_recovery_reverse();
+  phase = collector_phase_tick;
+  for (i = 0; i < sizeof(blocked)-1; i++) Motor_ProcessCommand(blocked[i]);
+  Motor_ProcessCommand('J'); /* no repeated command can extend the reversal */
+  assert(collector_phase_tick == phase && auto_state == AUTO_UNJAM);
+  assert(left_target_percent < 0 && right_target_percent < 0);
+  Auto_Update(); Mission_UpdateIntegration();
+  assert(left_target_percent < 0 && right_target_percent < 0);
+  test_log[0] = '\0'; Motor_ProcessCommand('V');
+  assert(strstr(test_log, "UNJAM=REVERSING BRUSH=REVERSE"));
+  Vision_ReportTelemetry(1);
+  assert(!strstr(test_log, "VISION"));
+  /* Real wheel-count conversion feeds the cap; one rotating wheel is enough
+   * to stop backing instead of turning twice as far with the other blocked. */
+  Robot_UpdateOdometry(-200, 0);
+  CollectorRecovery_Update();
+  assert(left_target_percent < 0);
+  Robot_UpdateOdometry(-300, 0);
+  CollectorRecovery_Update();
+  assert(collector_left_travel_mm >= 80 && collector_backup_done);
+  assert(left_target_percent == 0 && right_target_percent == 0);
+  assert(htim8.ccr[2] == COLLECTOR_REVERSE_PWM);
+  finish_recovery();
+  assert(auto_state == AUTO_IDLE); /* no repeat of pre-J manual F */
+
+  reset_test(); enter_recovery_reverse();
+  clock_ms += COLLECTOR_BACKUP_TIMEOUT_MS - 1;
+  CollectorRecovery_Update(); assert(left_target_percent < 0);
+  clock_ms++;
+  CollectorRecovery_Update();
+  assert(collector_backup_done && left_target_percent == 0);
+  assert(strstr(test_log, "BACKUP STOP: TIME LIMIT"));
+  assert(collector_left_travel_mm == 0); /* missing encoder cannot back forever */
+  finish_recovery();
+
+  reset_test(); clock_ms = UINT32_MAX - 100U;
+  enter_recovery_reverse(); /* HAL tick wrap is handled by unsigned subtraction */
+  clock_ms += COLLECTOR_REVERSE_DURATION_MS + 1000;
+  CollectorRecovery_Update(); /* delayed loop must stop both before any new output */
+  assert_recovery_stopped();
+  puts("PASS: unjam dead time, reverse polarity, per-wheel distance cap, encoder timeout, command ownership and tick wrap");
+}
+static void test_recovery_stop_and_restore(void)
+{
+  const char stops[] = "SX0";
+  unsigned s, phase;
+  for (s = 0; s < sizeof(stops)-1; s++)
+    for (phase = 0; phase < 3; phase++)
+    {
+      reset_test();
+      if (phase == 0) Motor_ProcessCommand('J');
+      else enter_recovery_reverse();
+      if (phase == 2)
+      {
+        clock_ms += COLLECTOR_REVERSE_DURATION_MS;
+        CollectorRecovery_Update();
+      }
+      Bluetooth_QueueFromISR(stops[s]);
+      Bluetooth_QueueFromISR('J');
+      Bluetooth_ProcessPending();
+      assert(collector_recovery_state == COLLECTOR_HOLD && auto_state == AUTO_IDLE);
+      assert_recovery_stopped();
+      clock_ms += 10000;
+      fresh(); CollectorRecovery_Update(); Auto_Update(); Mission_UpdateIntegration();
+      Motor_ProcessCommand('D');
+      assert_recovery_stopped();
+      assert(collector_recovery_state == COLLECTOR_HOLD);
+      Motor_ProcessCommand('K');
+      assert(collector_recovery_state == COLLECTOR_SETTLING);
+      clock_ms += COLLECTOR_DIRECTION_PAUSE_MS - 1;
+      CollectorRecovery_Update(); assert_recovery_stopped();
+      clock_ms++;
+      CollectorRecovery_Update();
+      assert(collector_recovery_state == COLLECTOR_IDLE && auto_state == AUTO_IDLE);
+      assert(htim8.ccr[2] == COLLECTOR_RUN_PWM && left_target_percent == 0);
+    }
+  reset_test(); enter_recovery_reverse(); Motor_ProcessCommand('S');
+  enter_recovery_reverse(); finish_recovery();
+  assert(auto_state == AUTO_IDLE);
+  puts("PASS: S/X/0 cancel every recovery phase and retain brush-off HOLD; K restores only after pause; J retries explicitly");
+}
+static void test_recovery_resume_and_servo_exclusion(void)
+{
+  AutoState_t states[] = {AUTO_DEBUG, AUTO_COLLECT, AUTO_COMBAT_PATROL};
+  unsigned i;
+  for (i = 0; i < sizeof(states)/sizeof(states[0]); i++)
+  {
+    uint16_t kept, stale;
+    uint32_t combat_elapsed;
+    reset_test();
+    auto_state = states[i];
+    if (auto_state == AUTO_COMBAT_PATROL)
+    {
+      CombatStrategy_Start(clock_ms);
+      CombatStrategy_RecordCollected(clock_ms);
+    }
+    MissionExtension_RecordCollected();
+    kept = TargetMap_Upsert(&target_map, 1, 1000, 1000, 90, clock_ms);
+    TargetMap_MarkCollected(&target_map, kept, clock_ms);
+    stale = TargetMap_Upsert(&target_map, 2, 1500, 1500, 90, clock_ms);
+    current_target_id = stale;
+    fresh();
+    enter_recovery_reverse();
+    Robot_UpdateOdometry(-500, -500);
+    CollectorRecovery_Update();
+    fresh();
+    finish_recovery();
+    combat_elapsed = CombatStrategy_ElapsedMs(clock_ms);
+    assert(MissionExtension_HasPayload());
+    assert(TargetMap_FindById(&target_map, kept)->collected);
+    assert(TargetMap_FindById(&target_map, stale) == NULL);
+    assert(robot_pose.x_mm < 1500 && robot_pose.x_mm > 1400);
+    assert(accepted_vision_frame_count == 0 && current_target_id == 0);
+    assert(servo_updates == 0);
+    if (states[i] == AUTO_DEBUG) assert(auto_state == AUTO_DEBUG);
+    else assert(auto_state == AUTO_SCAN);
+    if (states[i] == AUTO_COMBAT_PATROL)
+    {
+      assert(CombatStrategy_IsActive() && CombatStrategy_GetPayloadCount() == 1);
+      assert(combat_elapsed >= COLLECTOR_REVERSE_DURATION_MS);
+    }
+    Auto_Update(); Mission_UpdateIntegration();
+    assert(left_target_percent == 0 && right_target_percent == 0);
+    fresh(); Auto_Update();
+    if (states[i] != AUTO_DEBUG) assert(left_target_percent < 0 && right_target_percent > 0);
+  }
+  reset_test(); servo_test_active = 1;
+  Motor_ProcessCommand('J'); assert(collector_recovery_state == COLLECTOR_IDLE);
+  assert_brush_continues();
+  reset_test(); MissionExtension_RecordCollected(); MissionExtension_StartUnload(clock_ms);
+  Motor_ProcessCommand('J'); assert(collector_recovery_state == COLLECTOR_IDLE);
+  assert_brush_continues();
+  reset_test(); MissionExtension_RecordCollected(); auto_state = AUTO_COMPLETE;
+  Motor_ProcessCommand('J'); assert(collector_recovery_state == COLLECTOR_IDLE);
+  assert_brush_continues(); /* pending unload cannot resume blind after J */
+  puts("PASS: unjam preserves pose/inventory/combat time, invalidates old targets, requires new vision and excludes active unloading/servo tests");
+}
 int main(void)
 {
   reset_test(); test_pwm(); test_loss_and_recovery(); test_missing_target();
   test_deposit_next_batch(); test_scope_and_override(); test_manual_and_fault();
   test_debug_direct_follow(); test_mode_switch_and_stop();
   test_bluetooth_queue(); test_vision_telemetry();
+  test_recovery_distance_and_time(); test_recovery_stop_and_restore();
+  test_recovery_resume_and_servo_exclusion();
   puts("control regression tests passed");
   return 0;
 }
