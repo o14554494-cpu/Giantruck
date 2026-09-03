@@ -3,4 +3,5 @@
 **/Release/
 **/build/
 **/.DS_Store
-collection_car_combat_v5.3_scan_buzzer.zip
+# Generated delivery archives stay outside Git
+*.zip

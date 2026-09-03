@@ -1,5 +1,12 @@
 # Changelog
 
+## v6.1 — 工程命名统一（2026-09-03）
+
+- 工程目录改为 `STM32F103VET6_collection_car_combat_v6.1`；CubeIDE 工程名及 IOC 文件基名统一为 `collection_car_combat_v6_1`。
+- 同步 Debug/Release 构建目录引用、CubeMX 工程配置和文档链接；ELF 由 `${ProjName}` 自动命名为 `collection_car_combat_v6_1.elf`。
+- 启动蓝牙消息加入 `FW=v6.1` 版本标记，便于确认烧录的不是旧工程；本次不改变运动控制逻辑。
+- 历史变更记录仍保留其原始版本号，不将旧版本说明冒充为新版本。
+
 ## v6.1 — 蓝牙视觉诊断与直接跟随调试（2026-09-03）
 
 - 新增 D 调试模式：单帧选择一个最近前向目标，直接转向/接近，绕过质量、地图确认和场地定位门槛；不规划路线、不计数收集、不自动卸货。
@@ -8,7 +15,7 @@
 - 调试模式使用超声停车，不使用基于地图的后退/转弯避障；报告 OBSTACLE 便于诊断停车原因。
 - 蓝牙接收改为有界环形队列，S/X/0 优先，队列满请求停车。S 和手动接管取消旧卸货/避障动作，避免覆盖新模式输出。
 - 新增质量 0 单帧跟随、方向、失联恢复、模式切换、原始报文诊断和接收队列回归测试。
-- 详见 [DEBUG_MODE_GUIDE.md](STM32F103VET6_collection_car_combat_v5.3/DEBUG_MODE_GUIDE.md)。
+- 详见 [DEBUG_MODE_GUIDE.md](STM32F103VET6_collection_car_combat_v6.1/DEBUG_MODE_GUIDE.md)。
 
 ## v6 — 前刷常转、后舵机卸货（2026-09-02）
 
@@ -43,7 +50,7 @@
 - 原有模块测试及更新后的控制回归测试通过：覆盖视觉失联/恢复、目标丢失、蓝牙命令、完整卸货、下一轮和卸货超时期间前刷持续正转；EJECT 仍调用后舵机更新。
 - 相关固件 C 文件通过宿主 clang 语法检查。尚未完成本版 ARM 固件构建或实车验证。
 - 工程内部名称仍为 `STM32F103VET6_collection_car_combat_v5.3`，与收到的 v6 压缩包一致；请在 CubeIDE 重新构建并烧录。
-- 详细引脚、参数和状态表见 [v6 前刷修改说明](STM32F103VET6_collection_car_combat_v5.3/V6_BRUSH_CHANGELOG.md)。
+- 详细引脚、参数和状态表见 [v6 前刷修改说明](STM32F103VET6_collection_car_combat_v6.1/V6_BRUSH_CHANGELOG.md)。
 
 ## v5.3 控制修订（2026-09-02）
 
@@ -54,4 +61,4 @@
 - 在自动扫描、收集阶段显式启动滚轮，恢复卸货后下一轮收集。
 - 增加控制联动回归测试。
 
-该版前刷跟随任务启停的行为已被 v6 的独立常转逻辑取代。历史细节见 [v5.3 修订记录](STM32F103VET6_collection_car_combat_v5.3/V5.3_FIXES_20260902.md)。
+该版前刷跟随任务启停的行为已被 v6 的独立常转逻辑取代。历史细节见 [v5.3 修订记录](STM32F103VET6_collection_car_combat_v6.1/V5.3_FIXES_20260902.md)。

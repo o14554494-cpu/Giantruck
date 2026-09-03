@@ -2,11 +2,15 @@
 
 当前版本：**v6.1 视觉蓝牙诊断与直接跟随调试版**。
 
-蓝牙 `A`=技术赛收集，`C`=对抗赛，`D`=单帧视觉直接跟随，`S`=退出任务并停车，`V`=查看状态和原始目标质量。目标提示已由蜂鸣改为蓝牙 `SEEN ... Q=...`。使用说明见 [调试模式与质量诊断](STM32F103VET6_collection_car_combat_v5.3/DEBUG_MODE_GUIDE.md)。
+蓝牙 `A`=技术赛收集，`C`=对抗赛，`D`=单帧视觉直接跟随，`S`=退出任务并停车，`V`=查看状态和原始目标质量。目标提示已由蜂鸣改为蓝牙 `SEEN ... Q=...`。使用说明见 [调试模式与质量诊断](STM32F103VET6_collection_car_combat_v6.1/DEBUG_MODE_GUIDE.md)。
 
-前刷在初始化完成后以 50% PWM 持续正转，后舵机单独执行卸货。视觉失联只停车轮；蓝牙 S/X 也不关闭前刷。完整变更见 [Changelog](CHANGELOG.md) 和 [v6 前刷修改说明](STM32F103VET6_collection_car_combat_v5.3/V6_BRUSH_CHANGELOG.md)。
+前刷在初始化完成后以 50% PWM 持续正转，后舵机单独执行卸货。视觉失联只停车轮；蓝牙 S/X 也不关闭前刷。完整变更见 [Changelog](CHANGELOG.md) 和 [v6 前刷修改说明](STM32F103VET6_collection_car_combat_v6.1/V6_BRUSH_CHANGELOG.md)。
 
-这是 STM32F103VET6 控制端工程，工程内部仍沿用收到的 v6 包中的 `STM32F103VET6_collection_car_combat_v5.3` 名称。使用 STM32CubeIDE 导入工程目录并重新构建烧录。
+这是 STM32F103VET6 控制端工程，当前目录为 `STM32F103VET6_collection_car_combat_v6.1`，CubeIDE 工程名为 `collection_car_combat_v6_1`，CubeMX 配置为 `collection_car_combat_v6_1.ioc`。
+
+升级时在 STM32CubeIDE 中导入这个新工程，Clean 后重新 Build，并新建或检查烧录配置，确认程序路径指向新工程的 `Debug/collection_car_combat_v6_1.elf`（Release 构建则使用 Release 目录）。不要继续烧录旧 v5 工程的 ELF。启动蓝牙提示中的 `FW=v6.1` 可用于核对运行版本。
+
+`V5.3_CHANGELOG.md`、`V5.3_FIXES_20260902.md` 和 `V6_BRUSH_CHANGELOG.md` 是历史版本记录，故意保留原版本号；不代表当前固件版本。请以本 README 和根目录 CHANGELOG 为准。
 
 ## 当前功能
 
@@ -36,7 +40,7 @@
 `tests/` 中的主机测试可在 macOS/Linux 上运行：
 
 ```sh
-make -C STM32F103VET6_collection_car_combat_v5.3/tests test
+make -C STM32F103VET6_collection_car_combat_v6.1/tests test
 ```
 
 软件测试覆盖控制决策和模拟输出，尚未完成本版 ARM 构建或实车验证。

@@ -1955,7 +1955,7 @@ int main(void)
   Motor_Stop();
   Buzzer_Init();
   Vision_SendMode('S', 0U);
-  Motor_SendText("READY: A=TECH, C=COMBAT, D=DEBUG, S=STOP, X=RESET, F/B/L/R, M/P/V, G=SERVO\r\n");
+  Motor_SendText("READY FW=v6.1: A=TECH, C=COMBAT, D=DEBUG, S=STOP, X=RESET, F/B/L/R, M/P/V, G=SERVO\r\n");
 
   //前刷独立常转：初始化完成后正转，不受视觉/驾驶/卸货状态控制//
   CollectorDirection_Init();
