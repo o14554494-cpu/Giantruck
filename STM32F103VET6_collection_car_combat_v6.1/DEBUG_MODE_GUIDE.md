@@ -1,5 +1,7 @@
 # v6.1 视觉蓝牙诊断与直接跟随模式（2026-09-03）
 
+当前固件标记为 `FW=v6.1+AUTO_UNJAM`，新增前刷反馈和自动解卡；接线、校准和新指令见 [BRUSH_AUTO_FEEDBACK_GUIDE.md](BRUSH_AUTO_FEEDBACK_GUIDE.md)。默认先校准再发 E 启用，S/X/0 会关闭自动触发，H 可随时停刷。
+
 本版提供三个可用蓝牙切换的模式。默认上电是手动待机：前刷常转，车轮等待指令。控制工程目录为 `STM32F103VET6_collection_car_combat_v6.1`，CubeIDE 工程名及 IOC 基名为 `collection_car_combat_v6_1`。当前解卡修订的启动提示含 `FW=v6.1+UNJAM`。解卡流程和中断后的停刷例外见 [BRUSH_RECOVERY_GUIDE.md](BRUSH_RECOVERY_GUIDE.md)。
 
 ## 蓝牙指令

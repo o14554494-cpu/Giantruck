@@ -23,8 +23,16 @@ $(BUILD_DIR):
 $(TEST_BIN): $(BUILD_DIR) $(SOURCES)
 	$(CC) $(CFLAGS) -I$(CORE_INC) $(SOURCES) -o $(TEST_BIN)
 
-test: $(TEST_BIN)
+$(BUILD_DIR)/brush_feedback_test: brush_feedback_test.c $(CORE_SRC)/brush_feedback.c $(CORE_INC)/brush_feedback.h $(CORE_INC)/brush_feedback_config.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(CORE_INC) brush_feedback_test.c $(CORE_SRC)/brush_feedback.c -o $@
+
+$(BUILD_DIR)/brush_current_test: brush_feedback_test.c $(CORE_SRC)/brush_feedback.c $(CORE_INC)/brush_feedback.h $(CORE_INC)/brush_feedback_config.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(CORE_INC) -DBRUSH_CURRENT_ENABLE=1 -DBRUSH_CURRENT_ZERO_MV=1650 -DBRUSH_CURRENT_MV_PER_AMP=100 -DBRUSH_CURRENT_STALL_MA=1000 brush_feedback_test.c $(CORE_SRC)/brush_feedback.c -o $@
+
+test: $(TEST_BIN) $(BUILD_DIR)/brush_feedback_test $(BUILD_DIR)/brush_current_test
 	./$(TEST_BIN)
+	./$(BUILD_DIR)/brush_feedback_test
+	./$(BUILD_DIR)/brush_current_test
 	$(PYTHON) control_regression.py
 
 clean:

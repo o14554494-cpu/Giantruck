@@ -44,7 +44,8 @@ names = ['Motor_ClampPercent', 'Motor_SetOne', 'Motor_Set', 'Motor_SetTarget',
          'motor3_stop', 'motor3_reverse', 'CollectorRecovery_Start',
          'CollectorRecovery_Update', 'CollectorRecovery_Abort',
          'CollectorRecovery_Restore', 'CollectorRecovery_RecordTravel',
-         'CollectorRecovery_StateName', 'CollectorRecovery_SendStatus']
+         'CollectorRecovery_StateName', 'CollectorRecovery_SendStatus',
+         'CollectorFeedback_Update', 'CollectorFeedback_SendStatus', 'HCSR04_Measure']
 functions = [function(name) for name in names]
 prefix = r'''
 #include <assert.h>
@@ -57,6 +58,7 @@ prefix = r'''
 #include "vision_protocol.h"
 #include "mission_extension.h"
 #include "combat_strategy.h"
+#include "brush_feedback.h"
 typedef int GPIO_TypeDef;
 typedef struct { uint32_t arr, ccr[4]; } FakeTimer;
 static FakeTimer htim3 = {3599, {0}}, htim8 = {999, {0}};
@@ -67,6 +69,8 @@ static GPIO_TypeDef pins_b, pins_c;
 #define GPIO_PIN_1 1
 #define GPIO_PIN_2 2
 #define GPIO_PIN_3 3
+#define GPIO_PIN_5 5
+#define GPIO_PIN_6 6
 #define GPIO_PIN_SET 1
 #define GPIO_PIN_RESET 0
 #define TIM_CHANNEL_1 0
@@ -81,11 +85,24 @@ static void FakeCompare(FakeTimer *timer, unsigned channel, unsigned duty)
   if (timer == &htim8) brush_writes++;
 }
 static uint32_t clock_ms, mode_requests;
+static uint8_t feedback_test_ab;
 static unsigned test_irq_mask;
 static unsigned __get_PRIMASK(void) { return test_irq_mask; }
 static void __disable_irq(void) { test_irq_mask = 1; }
 static void __set_PRIMASK(unsigned mask) { test_irq_mask = mask; }
 static uint32_t HAL_GetTick(void) { return clock_ms; }
+static uint32_t test_cycles, cycle_calls, echo_reads;
+static unsigned echo_mode;
+static uint32_t HCSR04_Cycles(void)
+{ cycle_calls++; test_cycles += 72; return test_cycles; }
+static int HAL_GPIO_ReadPin(GPIO_TypeDef *port, uint16_t pin)
+{
+  (void)port; (void)pin;
+  echo_reads++;
+  if (echo_mode == 0) return 0;
+  if (echo_mode == 1) return 1;
+  return echo_reads > 4 && echo_reads < 1005;
+}
 static void HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, int value)
 {
   /* Changing H-bridge direction must happen with PWM already at zero. */
@@ -127,6 +144,12 @@ static void assert_brush_continues(void)
 static void reset_test(void)
 {
   clock_ms = 100;
+  BrushFeedback_Reset(clock_ms, 0);
+  feedback_test_ab = 0;
+  collector_reverse_start_count = collector_reverse_start_errors = 0;
+  collector_reverse_progress = collector_reverse_progress_tick = 0;
+  collector_use_encoder = collector_auto_cycle = collector_auto_attempts = 0;
+  collector_healthy_tracking = 0;
   collector_recovery_state = COLLECTOR_IDLE;
   collector_resume_state = AUTO_IDLE;
   collector_phase_tick = 0;
@@ -691,6 +714,149 @@ static void test_recovery_resume_and_servo_exclusion(void)
   assert_brush_continues(); /* pending unload cannot resume blind after J */
   puts("PASS: unjam preserves pose/inventory/combat time, invalidates old targets, requires new vision and excludes active unloading/servo tests");
 }
+static void feedback_steps(int count)
+{
+  const uint8_t next[4] = {1,3,0,2}, prev[4] = {2,0,3,1};
+  int i, n = count < 0 ? -count : count;
+  for (i = 0; i < n; i++)
+  {
+    feedback_test_ab = count < 0 ? prev[feedback_test_ab] : next[feedback_test_ab];
+    BrushFeedback_EncoderEdge(feedback_test_ab);
+  }
+}
+static void calibrate_and_run(void)
+{
+  Motor_ProcessCommand('H');
+  assert_recovery_stopped();
+  Motor_ProcessCommand('N');
+  Motor_ProcessCommand('T'); /* no counts: cannot invent a CPR */
+  assert(BrushFeedback_Cpr() == 0);
+  feedback_steps(40);
+  Motor_ProcessCommand('T');
+  assert(BrushFeedback_Cpr() == 40);
+  Motor_ProcessCommand('K');
+  clock_ms += COLLECTOR_DIRECTION_PAUSE_MS;
+  CollectorRecovery_Update();
+  feedback_steps(4); clock_ms += 100; CollectorFeedback_Update();
+  assert(BrushFeedback_Snapshot(clock_ms).rpm_x10 == 600);
+}
+static void await_auto_stall(void)
+{
+  unsigned i;
+  for (i = 0; i < 20 && collector_recovery_state == COLLECTOR_IDLE; i++)
+  {
+    clock_ms += 100;
+    CollectorFeedback_Update();
+  }
+  assert(collector_recovery_state != COLLECTOR_IDLE);
+}
+static void finish_encoder_cycle(void)
+{
+  unsigned i;
+  assert(collector_recovery_state == COLLECTOR_STOPPING);
+  clock_ms += COLLECTOR_DIRECTION_PAUSE_MS;
+  CollectorRecovery_Update();
+  assert(collector_recovery_state == COLLECTOR_REVERSING);
+  for (i = 0; i < 3; i++)
+  {
+    feedback_steps(-20); clock_ms += 100;
+    CollectorFeedback_Update(); CollectorRecovery_Update();
+    assert(collector_recovery_state == COLLECTOR_REVERSING);
+  }
+  feedback_steps(-19); clock_ms += 100;
+  CollectorFeedback_Update(); CollectorRecovery_Update();
+  assert(collector_reverse_progress == 79 && collector_recovery_state == COLLECTOR_REVERSING);
+  feedback_steps(-1); CollectorRecovery_Update();
+  assert(collector_reverse_progress == 80 && collector_recovery_state == COLLECTOR_SETTLING);
+  assert_recovery_stopped(); /* exactly two calibrated revolutions, no timer fallback */
+  clock_ms += COLLECTOR_DIRECTION_PAUSE_MS;
+  CollectorRecovery_Update();
+  assert(collector_recovery_state == COLLECTOR_IDLE && htim8.ccr[2] == COLLECTOR_RUN_PWM);
+}
+static void test_feedback_commands_and_auto(void)
+{
+  unsigned i;
+  reset_test();
+  Motor_ProcessCommand('E');
+  assert(!BrushFeedback_Snapshot(clock_ms).enabled);
+  calibrate_and_run();
+  Motor_ProcessCommand('E');
+  assert(BrushFeedback_Snapshot(clock_ms).enabled);
+  auto_state = AUTO_DEBUG;
+  MissionExtension_RecordCollected();
+  await_auto_stall();
+  assert(collector_auto_cycle && collector_auto_attempts == 1);
+  assert(collector_use_encoder);
+  finish_encoder_cycle();
+  assert(auto_state == AUTO_DEBUG && MissionExtension_HasPayload());
+  Auto_Update(); assert(left_target_percent == 0 && right_target_percent == 0);
+  await_auto_stall();
+  assert(collector_auto_attempts == 2);
+  finish_encoder_cycle();
+  await_auto_stall();
+  assert(collector_recovery_state == COLLECTOR_HOLD);
+  assert(!BrushFeedback_Snapshot(clock_ms).enabled);
+  assert_recovery_stopped();
+
+  reset_test(); calibrate_and_run(); Motor_ProcessCommand('E');
+  await_auto_stall(); finish_encoder_cycle();
+  for (i = 0; i < 110; i++)
+  {
+    feedback_steps(4); clock_ms += 100; CollectorFeedback_Update();
+  }
+  assert(collector_auto_attempts == 0); /* sustained success resets the budget */
+  Motor_ProcessCommand('S');
+  assert(!BrushFeedback_Snapshot(clock_ms).enabled);
+  assert(htim8.ccr[2] == COLLECTOR_RUN_PWM); /* normal S still keeps front brush */
+  for (i = 0; i < 20; i++) { clock_ms += 100; CollectorFeedback_Update(); }
+  assert(collector_recovery_state == COLLECTOR_IDLE);
+}
+static void test_feedback_fault_and_manual_counting(void)
+{
+  reset_test(); calibrate_and_run();
+  Motor_ProcessCommand('J'); finish_encoder_cycle(); /* E not required for manual counting */
+
+  Motor_ProcessCommand('J');
+  clock_ms += COLLECTOR_DIRECTION_PAUSE_MS; CollectorRecovery_Update();
+  clock_ms += BRUSH_REVERSE_NO_PROGRESS_MS; CollectorRecovery_Update();
+  assert(collector_recovery_state == COLLECTOR_HOLD); assert_recovery_stopped();
+
+  reset_test(); calibrate_and_run(); Motor_ProcessCommand('J');
+  clock_ms += COLLECTOR_DIRECTION_PAUSE_MS; CollectorRecovery_Update();
+  BrushFeedback_EncoderEdge(feedback_test_ab ^ 3U);
+  CollectorRecovery_Update();
+  assert(collector_recovery_state == COLLECTOR_HOLD); assert_recovery_stopped();
+
+  reset_test(); calibrate_and_run(); Motor_ProcessCommand('E');
+  await_auto_stall();
+  Motor_ProcessCommand('O');
+  assert(!BrushFeedback_Snapshot(clock_ms).enabled);
+  assert(collector_recovery_state == COLLECTOR_HOLD); assert_recovery_stopped();
+
+  reset_test(); calibrate_and_run(); Motor_ProcessCommand('E');
+  MissionExtension_RecordCollected(); MissionExtension_StartUnload(clock_ms);
+  await_auto_stall(); /* must stop a stalled brush rather than reverse during unloading */
+  assert(collector_recovery_state == COLLECTOR_HOLD && !BrushFeedback_Snapshot(clock_ms).enabled);
+  assert(MissionExtension_HasPayload()); assert_recovery_stopped();
+  puts("PASS: feedback calibration/arming, automatic retry limit, counted two turns, reverse feedback fault, disarm and unload interaction");
+}
+static void test_ultrasound_wrap(void)
+{
+  unsigned mode;
+  for (mode = 0; mode < 3; mode++)
+  {
+    uint32_t normal, wrapped;
+    echo_mode = mode; echo_reads = cycle_calls = 0; test_cycles = 50000;
+    normal = HCSR04_Measure();
+    assert(cycle_calls < 31000);
+    echo_reads = cycle_calls = 0; test_cycles = UINT32_MAX - 100;
+    wrapped = HCSR04_Measure();
+    assert(cycle_calls < 31000 && normal == wrapped);
+    if (mode < 2) assert(wrapped == 0);
+    else assert(wrapped >= 170 && wrapped <= 175);
+  }
+  puts("PASS: ultrasonic low/high echo timeouts and valid pulse width across DWT cycle wrap");
+}
 int main(void)
 {
   reset_test(); test_pwm(); test_loss_and_recovery(); test_missing_target();
@@ -699,6 +865,8 @@ int main(void)
   test_bluetooth_queue(); test_vision_telemetry();
   test_recovery_distance_and_time(); test_recovery_stop_and_restore();
   test_recovery_resume_and_servo_exclusion();
+  test_feedback_commands_and_auto(); test_feedback_fault_and_manual_counting();
+  test_ultrasound_wrap();
   puts("control regression tests passed");
   return 0;
 }
@@ -710,7 +878,7 @@ with tempfile.TemporaryDirectory(prefix='car-control-test-') as tmp:
     test_c = Path(tmp) / 'control_test.c'
     test_bin = Path(tmp) / 'control_test'
     test_c.write_text(program)
-    sources = ['path_planner', 'target_map', 'vision_protocol',
+    sources = ['path_planner', 'target_map', 'vision_protocol', 'brush_feedback',
                'mission_extension', 'combat_strategy']
     subprocess.run(shlex.split(os.environ.get('CC', 'cc')) +
                    ['-std=c11', '-Wall', '-Wextra', '-Werror',
