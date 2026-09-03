@@ -1,6 +1,8 @@
 # Giantruck collection car
 
-当前版本：**v6.1 + AUTO_UNJAM 前刷反馈与自动解卡修订**。
+当前版本：**v6.1 + GREEDY 最近目标优先模式**（包含前刷反馈与自动解卡）。
+
+新增蓝牙 `Q`：单帧发现目标后按当前直线距离排序，行驶中持续更新列表，近距离锁定并收集；列表为空旋转补扫，完成 10 次收集动作后回仓、倒车、舵机卸货并停车。Q 不调用路线优化器。当前计数由 900 ms 收集动作推定，未接入真实入仓确认。使用与参数见 [Q 模式说明](STM32F103VET6_collection_car_combat_v6.1/GREEDY_MODE_GUIDE.md)。
 
 已接入 PB12/PB15 前刷 A/B 编码器、PA4 可选模拟电流反馈。先校准每圈计数，再发 E 启用自动解卡；默认不在未知编码器参数下自动后退。完整接线、CubeMX 配置和 H/N/T/K/E 校准流程见 [自动解卡与引脚配置](STM32F103VET6_collection_car_combat_v6.1/BRUSH_AUTO_FEEDBACK_GUIDE.md)。
 
@@ -10,7 +12,7 @@
 
 这是 STM32F103VET6 控制端工程，当前目录为 `STM32F103VET6_collection_car_combat_v6.1`，CubeIDE 工程名为 `collection_car_combat_v6_1`，CubeMX 配置为 `collection_car_combat_v6_1.ioc`。
 
-升级时在 STM32CubeIDE 中导入这个新工程，Clean 后重新 Build，并新建或检查烧录配置，确认程序路径指向新工程的 `Debug/collection_car_combat_v6_1.elf`（Release 构建则使用 Release 目录）。启动蓝牙提示中的 `FW=v6.1+AUTO_UNJAM` 可用于核对运行版本。
+升级时在 STM32CubeIDE 中导入这个新工程，刷新工程、Clean 后重新 Build，确认 `greedy_collection.c` 参与编译，并新建或检查烧录配置，确认程序路径指向新工程的 `Debug/collection_car_combat_v6_1.elf`（Release 构建则使用 Release 目录）。启动蓝牙提示中的 `FW=v6.1+GREEDY` 可用于核对运行版本。
 
 `V5.3_CHANGELOG.md`、`V5.3_FIXES_20260902.md` 和 `V6_BRUSH_CHANGELOG.md` 是历史版本记录，故意保留原版本号；不代表当前固件版本。请以本 README 和根目录 CHANGELOG 为准。
 
@@ -25,6 +27,7 @@
 - 车轮非零档位映射到 60%～100%；保留用户 v6 新增的 80%、200ms 启动补偿实现及其已知限制（见 Changelog）
 - 蓝牙输出视觉目标数量、原始质量和过滤原因；蜂鸣器静音
 - D 调试模式单帧跟随一个目标，无质量/确认次数门槛，不规划路线
+- Q 最近距离优先自动收集，V 显示本轮计数，M/P 输出动态距离列表，完成 10 次后自动回仓卸货；无需新增引脚
 - J/自动解卡：停刷缓冲 → 反转并后退 → 停刷缓冲 → 正转；后退有轮程及超时限制，校准后的前刷以反向计数控制两圈
 - 前刷低速持续确认、启动宽限期、最多两次连续自动尝试、反馈异常与反转无进展停刷；电流保护需配置后才启用
 

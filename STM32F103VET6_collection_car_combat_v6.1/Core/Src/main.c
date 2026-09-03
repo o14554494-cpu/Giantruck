@@ -35,6 +35,7 @@
 #include "servo.h"
 #include "drive_pwm.h"
 #include "brush_feedback.h"
+#include "greedy_collection.h"
 
 /* USER CODE END Includes */
 
@@ -227,6 +228,7 @@ static float scan_accumulated_angle;
 static uint16_t current_target_id;
 static uint8_t plan_dirty;
 static uint8_t empty_plan_retry_count;
+static uint8_t greedy_active;
 static float combat_patrol_x_mm;
 static float combat_patrol_y_mm;
 static AutoState_t auto_state = AUTO_IDLE;
@@ -297,6 +299,8 @@ static void Bluetooth_ProcessPending(void);
 static void Vision_ReportTelemetry(uint8_t force);
 static void Debug_Start(void);
 static void Debug_Update(uint32_t now);
+static void Greedy_SendStatus(uint8_t detailed);
+static uint8_t Auto_AvailableCount(void);
 static const char *Robot_ModeName(void);
 static void Robot_UpdateOdometry(int32_t left_delta, int32_t right_delta);
 static void Vision_ProcessIncoming(void);
@@ -798,6 +802,21 @@ static void Motor_ProcessCommand(uint8_t command)
       Motor_SendText("MODE=DEBUG: ONE FRAME FOLLOW, NO MAP/QUALITY GATE\r\n");
       break;
 
+    case 'Q':
+    {
+      char message[96];
+      servo_test_active = 0U;
+      Servo_Stop();
+      CombatStrategy_Stop();
+      Auto_Start();
+      greedy_active = 1U;
+      (void)snprintf(message, sizeof(message),
+          "MODE=GREEDY: DISTANCE ONLY, PICKUP ACTIONS=%u THEN UNLOAD\r\n",
+          (unsigned)GREEDY_BATCH_SIZE);
+      Motor_SendText(message);
+      break;
+    }
+
     case 'J':
       CollectorRecovery_Start();
       break;
@@ -920,7 +939,7 @@ static void Motor_SendStatus(void)
                  Auto_StateName(auto_state),
                  (long)robot_pose.x_mm, (long)robot_pose.y_mm,
                  (long)(robot_pose.heading_rad * 1000.0f),
-                 (unsigned int)TargetMap_CountAvailable(&target_map),
+                 (unsigned int)Auto_AvailableCount(),
                  (unsigned int)latest_vision_frame.sequence,
                  (unsigned long)vision_age_ms,
                  (unsigned long)accepted_vision_frame_count,
@@ -955,6 +974,7 @@ static const char *Robot_ModeName(void)
   if (collector_recovery_state == COLLECTOR_HOLD) return "JAM_HOLD";
   if (collector_recovery_state != COLLECTOR_IDLE) return "UNJAM";
   if (auto_state == AUTO_DEBUG) return "DEBUG";
+  if (greedy_active) return "GREEDY";
   if (CombatStrategy_IsActive() != 0U) return "COMBAT";
   if (auto_state == AUTO_IDLE) return "MANUAL";
   return "TECH";
@@ -974,6 +994,7 @@ static void Vision_ReportTelemetry(uint8_t force)
       (uint32_t)(now - vision_report_tick) < VISION_REPORT_PERIOD_MS) return;
   vision_report_tick = now;
   vision_report_due = 0U;
+  if (greedy_active) Greedy_SendStatus(0U);
   if (accepted_vision_frame_count == 0U)
   {
     (void)snprintf(line, sizeof(line), "VISION NO_FRAME RXERR=%lu MODE=%s DBG=%s\r\n",
@@ -985,7 +1006,7 @@ static void Vision_ReportTelemetry(uint8_t force)
       "VISION %s SEQ=%u RAW=%u MAP=%u AGE=%lu RXERR=%lu MODE=%s DBG=%s PICK=%d\r\n",
       age > timeout ? "STALE" : "OK", (unsigned int)latest_vision_frame.sequence,
       (unsigned int)latest_vision_frame.target_count,
-      (unsigned int)TargetMap_CountAvailable(&target_map), (unsigned long)age,
+      (unsigned int)Auto_AvailableCount(), (unsigned long)age,
       (unsigned long)VisionProtocol_GetErrorCount(), Robot_ModeName(), debug_action,
       (int)debug_target_index);
   Motor_SendText(line);
@@ -1084,7 +1105,7 @@ static void Vision_ApplyFrame(const VisionFrame_t *frame)
       vision_filter_reason[index] = "DEBUG_BYPASS";
       continue;
     }
-    if (observation->quality < VISION_MIN_ACCEPTED_QUALITY)
+    if (!greedy_active && observation->quality < VISION_MIN_ACCEPTED_QUALITY)
     {
       vision_filter_reason[index] = "LOW_Q";
       continue;
@@ -1103,6 +1124,14 @@ static void Vision_ApplyFrame(const VisionFrame_t *frame)
     if (MissionExtension_TargetInsideArena(global_x, global_y) == 0U)
     {
       vision_filter_reason[index] = "OUTSIDE";
+      continue;
+    }
+
+    if (greedy_active)
+    {
+      Greedy_Observe(observation->color, global_x, global_y,
+                     observation->quality, now);
+      vision_filter_reason[index] = "GREEDY_DISTANCE";
       continue;
     }
 
@@ -1143,6 +1172,8 @@ static void Auto_StartScan(uint32_t timeout_ms)
 
 static void Auto_Start(void)
 {
+  greedy_active = 0U;
+  Greedy_Reset();
   debug_action = "OFF";
   debug_target_index = -1;
   vision_report_due = 1U;
@@ -1169,6 +1200,7 @@ static void Auto_Start(void)
 
 static void Auto_Stop(uint8_t clear_map)
 {
+  greedy_active = 0U;
   /* Manual takeover must also cancel a previous unloading/avoidance action. */
   MissionExtension_CancelMotion();
   debug_action = "OFF";
@@ -1277,6 +1309,32 @@ static void Debug_Update(uint32_t now)
 static void Auto_BuildPlan(void)
 {
   uint32_t now = HAL_GetTick();
+  if (greedy_active)
+  {
+    MapTarget_t *nearest;
+    memset(&planned_route, 0, sizeof(planned_route));
+    last_plan_tick = now;
+    plan_dirty = 0U;
+    current_target_id = 0U;
+    if (Greedy_CountCollected() >= GREEDY_BATCH_SIZE)
+    {
+      Motor_Stop();
+      auto_state = AUTO_COMPLETE;
+      return;
+    }
+    nearest = Greedy_Nearest(&robot_pose, now);
+    if (nearest == NULL)
+    {
+      Auto_StartScan(AUTO_SCAN_TIMEOUT_MS);
+      Motor_SendText("GREEDY EMPTY: RESCAN; KEEP PICKUP COUNT\r\n");
+      return;
+    }
+    current_target_id = nearest->id;
+    auto_state = AUTO_NAVIGATE;
+    auto_state_start_tick = now;
+    Vision_SendMode('S', 0U);
+    return;
+  }
   uint8_t candidate_count = TargetMap_GetCandidates(
       &target_map, planner_candidates, TARGET_MAP_MAX_TARGETS);
 
@@ -1378,7 +1436,8 @@ static void Auto_BuildPlan(void)
 
 static const VisionTarget_t *Auto_FindCurrentVisionTarget(void)
 {
-  MapTarget_t *map_target = TargetMap_FindById(&target_map, current_target_id);
+  MapTarget_t *map_target = greedy_active ? Greedy_Find(current_target_id, HAL_GetTick()) :
+                          TargetMap_FindById(&target_map, current_target_id);
   const VisionTarget_t *best_target = NULL;
   float heading_cos;
   float heading_sin;
@@ -1415,7 +1474,7 @@ static const VisionTarget_t *Auto_FindCurrentVisionTarget(void)
     }
     if ((observation->forward_mm < VISION_MIN_FORWARD_MM) ||
         (observation->forward_mm > VISION_MAX_FORWARD_MM) ||
-        (observation->quality < VISION_MIN_ACCEPTED_QUALITY))
+        (!greedy_active && observation->quality < VISION_MIN_ACCEPTED_QUALITY))
     {
       continue;
     }
@@ -1485,6 +1544,7 @@ static uint8_t Auto_CheckVision(uint32_t now)
       vision_motion_hold = 1U;
       current_target_id = 0U;
       memset(&planned_route, 0, sizeof(planned_route));
+      if (greedy_active) Greedy_ClearPending();
       /* Keep already-collected history and payload, discard stale candidates. */
       for (index = 0U; index < TARGET_MAP_MAX_TARGETS; index++)
       {
@@ -1580,6 +1640,12 @@ static void Auto_Update(void)
       break;
 
     case AUTO_SCAN:
+      if (greedy_active && Greedy_Nearest(&robot_pose, now) != NULL)
+      {
+        Motor_Stop();
+        auto_state = AUTO_PLAN;
+        break;
+      }
       Motor_SetTarget(-AUTO_SCAN_SPEED_PERCENT, AUTO_SCAN_SPEED_PERCENT);
       if ((scan_accumulated_angle >= AUTO_SCAN_MIN_ROTATION_RAD) ||
           ((now - auto_state_start_tick) >= current_scan_timeout_ms))
@@ -1596,7 +1662,8 @@ static void Auto_Update(void)
 
     case AUTO_NAVIGATE:
     {
-      MapTarget_t *target = TargetMap_FindById(&target_map, current_target_id);
+      MapTarget_t *target = greedy_active ? Greedy_Find(current_target_id, now) :
+                            TargetMap_FindById(&target_map, current_target_id);
       float heading_cos;
       float heading_sin;
       float dx;
@@ -1607,6 +1674,7 @@ static void Auto_Update(void)
 
       if ((target == NULL) || (target->collected != 0U))
       {
+        if (greedy_active) Motor_Stop();
         auto_state = AUTO_PLAN;
         break;
       }
@@ -1619,7 +1687,14 @@ static void Auto_Update(void)
       local_left = -heading_sin * dx + heading_cos * dy;
       distance = Planner_Sqrt(dx * dx + dy * dy);
 
-      if ((plan_dirty != 0U) &&
+      if (greedy_active && plan_dirty && distance > AUTO_APPROACH_RADIUS_MM &&
+          (uint32_t)(now - last_plan_tick) >= GREEDY_SELECT_INTERVAL_MS)
+      {
+        Auto_BuildPlan();
+        break;
+      }
+
+      if (!greedy_active && (plan_dirty != 0U) &&
           ((now - last_plan_tick) >= AUTO_REPLAN_PERIOD_MS) &&
           (distance > (AUTO_APPROACH_RADIUS_MM + 150.0f)))
       {
@@ -1632,7 +1707,8 @@ static void Auto_Update(void)
         Motor_Stop();
         auto_state = AUTO_FINAL_ALIGN;
         auto_state_start_tick = now;
-        Vision_SendMode('T', target->color);
+        /* Greedy keeps observing both colours while locking pickup motion. */
+        Vision_SendMode(greedy_active ? 'S' : 'T', greedy_active ? 0U : target->color);
       }
       else
       {
@@ -1695,14 +1771,34 @@ static void Auto_Update(void)
       if ((now - auto_state_start_tick) >= AUTO_COLLECT_DURATION_MS)
       {
         Motor_Stop();
-        TargetMap_MarkCollected(&target_map, current_target_id, now);
-        MissionExtension_RecordCollected();
-        CombatStrategy_RecordCollected(now);
+        if (greedy_active)
+        {
+          char report[80];
+          if (Greedy_MarkCollected(current_target_id)) MissionExtension_RecordCollected();
+          (void)snprintf(report, sizeof(report),
+                         "GREEDY COLLECTED=%u/%u ASSUMED=1\r\n",
+                         (unsigned)Greedy_CountCollected(), (unsigned)GREEDY_BATCH_SIZE);
+          Motor_SendText(report);
+        }
+        else
+        {
+          TargetMap_MarkCollected(&target_map, current_target_id, now);
+          MissionExtension_RecordCollected();
+          CombatStrategy_RecordCollected(now);
+        }
         current_target_id = 0U;
         plan_dirty = 1U;
         auto_state = AUTO_PLAN;
         auto_state_start_tick = now;
         Vision_SendMode('S', 0U);
+        if (greedy_active && Greedy_CountCollected() >= GREEDY_BATCH_SIZE)
+        {
+          char report[64];
+          auto_state = AUTO_COMPLETE;
+          (void)snprintf(report, sizeof(report), "GREEDY BATCH=%u: RETURN TO UNLOAD\r\n",
+                         (unsigned)GREEDY_BATCH_SIZE);
+          Motor_SendText(report);
+        }
       }
       break;
 
@@ -1711,6 +1807,7 @@ static void Auto_Update(void)
       if ((now - auto_state_start_tick) >= AUTO_RECOVER_DURATION_MS)
       {
         Motor_Stop();
+        if (greedy_active) Greedy_Forget(current_target_id);
         auto_state = AUTO_PLAN;
         auto_state_start_tick = now;
       }
@@ -1755,8 +1852,41 @@ static void Auto_Update(void)
   }
 }
 
+static uint8_t Auto_AvailableCount(void)
+{
+  uint16_t ids[GREEDY_CAPACITY];
+  return greedy_active ? Greedy_List(&robot_pose, HAL_GetTick(), ids, GREEDY_CAPACITY) :
+                         TargetMap_CountAvailable(&target_map);
+}
+
+static void Greedy_SendStatus(uint8_t detailed)
+{
+  uint16_t ids[GREEDY_CAPACITY];
+  uint32_t now = HAL_GetTick();
+  uint8_t i, count = Greedy_List(&robot_pose, now, ids, GREEDY_CAPACITY);
+  char line[144];
+  (void)snprintf(line, sizeof(line),
+      "GREEDY COUNT=%u/%u LIST=%u CURRENT=%u STATE=%s ASSUMED=1\r\n",
+      (unsigned)Greedy_CountCollected(), (unsigned)GREEDY_BATCH_SIZE,
+      (unsigned)count, (unsigned)current_target_id, Auto_StateName(auto_state));
+  Motor_SendText(line);
+  if (!detailed) return;
+  for (i = 0; i < count; i++)
+  {
+    MapTarget_t *t = Greedy_Find(ids[i], now);
+    float dx = t->x_mm - robot_pose.x_mm, dy = t->y_mm - robot_pose.y_mm;
+    (void)snprintf(line, sizeof(line),
+        "DIST RANK=%u ID=%u MM=%lu C=%u X=%ld Y=%ld AGE=%lu\r\n",
+        (unsigned)i + 1U, (unsigned)t->id,
+        (unsigned long)Planner_Sqrt(dx*dx + dy*dy), (unsigned)t->color,
+        (long)t->x_mm, (long)t->y_mm, (unsigned long)(now - t->last_seen_ms));
+    Motor_SendText(line);
+  }
+}
+
 static void Auto_SendMap(void)
 {
+  if (greedy_active) { Greedy_SendStatus(1U); return; }
   char line[128];
   uint8_t index;
 
@@ -1785,6 +1915,7 @@ static void Auto_SendMap(void)
 
 static void Auto_SendPlan(void)
 {
+  if (greedy_active) { Greedy_SendStatus(1U); return; }
   char line[128];
   uint8_t index;
 
@@ -2072,6 +2203,7 @@ static void CollectorRecovery_Update(void)
        * collected inventory, but require a NEW frame before autonomous motion. */
       for (index = 0U; index < TARGET_MAP_MAX_TARGETS; index++)
         if (target_map.targets[index].collected == 0U) target_map.targets[index].valid = 0U;
+      if (greedy_active) Greedy_ClearPending();
       memset(&latest_vision_frame, 0, sizeof(latest_vision_frame));
       latest_vision_tick = 0U;
       accepted_vision_frame_count = 0U;
@@ -2383,7 +2515,7 @@ int main(void)
   Motor_Stop();
   Buzzer_Init();
   Vision_SendMode('S', 0U);
-  Motor_SendText("READY FW=v6.1+AUTO_UNJAM: A/C/D=MODES, J=UNJAM, K=BRUSH_RUN, H=HOLD, N=ZERO, T=TEACH, E=ARM, O=DISARM, S=STOP, V=STATUS\r\n");
+  Motor_SendText("READY FW=v6.1+GREEDY: A/C/D/Q=MODES, J=UNJAM, K=BRUSH_RUN, H=HOLD, N=ZERO, T=TEACH, E=ARM, O=DISARM, S=STOP, V=STATUS\r\n");
 
   //前刷默认正转；J 解卡及其中断 HOLD 可以反转/停刷//
   CollectorDirection_Init();

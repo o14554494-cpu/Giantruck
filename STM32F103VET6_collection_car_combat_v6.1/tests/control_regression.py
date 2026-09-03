@@ -32,6 +32,7 @@ def function(name):
     return source[match.start():end]
 
 names = ['Motor_ClampPercent', 'Motor_SetOne', 'Motor_Set', 'Motor_SetTarget',
+         'Greedy_SendStatus', 'Auto_StateName', 'Auto_SendMap', 'Auto_SendPlan', 'Auto_AvailableCount',
          'Motor_ResetPid', 'Motor_Stop', 'Robot_AbsFloat',
          'Auto_StartScan', 'Auto_Start', 'Auto_Stop', 'Auto_CheckVision',
          'Auto_Update', 'Auto_BuildPlan', 'Auto_FindCurrentVisionTarget',
@@ -46,7 +47,7 @@ names = ['Motor_ClampPercent', 'Motor_SetOne', 'Motor_Set', 'Motor_SetTarget',
          'CollectorRecovery_Restore', 'CollectorRecovery_RecordTravel',
          'CollectorRecovery_StateName', 'CollectorRecovery_SendStatus',
          'CollectorFeedback_Update', 'CollectorFeedback_SendStatus', 'HCSR04_Measure']
-functions = [function(name) for name in names]
+functions = [function(name).replace('Planner_BuildRoute(', 'CountedPlanner(') for name in names]
 prefix = r'''
 #include <assert.h>
 #include <stdint.h>
@@ -59,6 +60,11 @@ prefix = r'''
 #include "mission_extension.h"
 #include "combat_strategy.h"
 #include "brush_feedback.h"
+#include "greedy_collection.h"
+static unsigned planner_calls;
+static void CountedPlanner(const RobotPose_t *p, const MapTarget_t *c,
+                           uint8_t n, PlannerRoute_t *r)
+{ planner_calls++; Planner_BuildRoute(p, c, n, r); }
 typedef int GPIO_TypeDef;
 typedef struct { uint32_t arr, ccr[4]; } FakeTimer;
 static FakeTimer htim3 = {3599, {0}}, htim8 = {999, {0}};
@@ -125,8 +131,6 @@ static void Servo_StartEject(void) {}
 static void Servo_Stop(void) {}
 static void Servo_Update(uint32_t now) { (void)now; servo_updates++; }
 static void Motor_SendStatus(void) {}
-static void Auto_SendMap(void) {}
-static void Auto_SendPlan(void) {}
 '''
 checks = r'''
 static void fresh(void)
@@ -158,6 +162,8 @@ static void reset_test(void)
   servo_test_active = 0;
   htim8.ccr[2] = brush_in1 = brush_in2 = 0;
   CombatStrategy_Reset();
+  Greedy_Reset(); greedy_active = 0;
+  planner_calls = 0;
   MissionExtension_Reset();
   TargetMap_Reset(&target_map);
   memset(&planned_route, 0, sizeof(planned_route));
@@ -857,6 +863,132 @@ static void test_ultrasound_wrap(void)
   }
   puts("PASS: ultrasonic low/high echo timeouts and valid pulse width across DWT cycle wrap");
 }
+static void test_greedy_memory(void)
+{
+  RobotPose_t pose = {0, 0, 0};
+  uint16_t ids[GREEDY_CAPACITY], near_id, far_id;
+  unsigned i;
+  Greedy_Reset();
+  Greedy_Observe(1, 1000, 0, 100, 100);
+  Greedy_Observe(2, 600, 0, 0, 100);
+  assert(Greedy_List(&pose, 100, ids, GREEDY_CAPACITY) == 2);
+  near_id = ids[0]; far_id = ids[1];
+  assert(Greedy_Find(near_id, 100)->quality == 0);
+  pose.x_mm = 1100;
+  assert(Greedy_Nearest(&pose, 100)->id == far_id); /* distance changes with motion */
+  Greedy_Observe(1, 1050, 0, 0, 200);
+  assert(Greedy_List(&pose, 200, ids, GREEDY_CAPACITY) == 2);
+  assert(Greedy_Find(far_id, 200)->x_mm == 1050);
+  assert(Greedy_MarkCollected(far_id));
+  assert(!Greedy_MarkCollected(far_id));
+  Greedy_ClearPending();
+  Greedy_Observe(1, 1050, 0, 100, 5000);
+  assert(!Greedy_List(&pose, 5000, ids, GREEDY_CAPACITY));
+  assert(Greedy_CountCollected() == 1);
+  Greedy_Observe(2, 300, 0, 0, UINT32_MAX - 100);
+  assert(Greedy_List(&pose, 100, ids, GREEDY_CAPACITY) == 1);
+  assert(!Greedy_List(&pose, GREEDY_TARGET_TTL_MS + 100, ids, GREEDY_CAPACITY));
+  /* Full memory evicts uncollected entries only. */
+  for (i = 0; i < GREEDY_CAPACITY + 4; i++) Greedy_Observe(2, i * 200.0f, 900, 0, 30000+i);
+  assert(Greedy_List(&pose, 30100, ids, GREEDY_CAPACITY) == GREEDY_CAPACITY-1);
+  Greedy_ClearPending(); Greedy_Observe(1, 1050, 0, 100, 30200);
+  assert(!Greedy_Nearest(&pose, 30200));
+  puts("PASS: greedy distance ordering/moving pose, single low-Q frame, dedup, expiry/wrap, collected tombstones and capacity");
+}
+
+static void greedy_frame(uint16_t forward)
+{
+  VisionFrame_t frame = {0};
+  frame.target_count = 1;
+  frame.targets[0].color = 1;
+  frame.targets[0].forward_mm = forward;
+  frame.targets[0].quality = 0;
+  Vision_ApplyFrame(&frame);
+}
+
+static void test_greedy_transitions(void)
+{
+  uint16_t first, nearer;
+  reset_test(); Motor_ProcessCommand('Q');
+  assert(greedy_active && auto_state == AUTO_SCAN);
+  Auto_Update(); assert(vision_motion_hold && !motor_running);
+  fresh(); clock_ms += 20; Auto_Update();
+  greedy_frame(800); clock_ms += 20; Auto_Update();
+  assert(auto_state == AUTO_PLAN);
+  clock_ms += 20; Auto_Update();
+  first = current_target_id;
+  assert(first && auto_state == AUTO_NAVIGATE && Auto_AvailableCount() == 1);
+  greedy_frame(350);
+  clock_ms += GREEDY_SELECT_INTERVAL_MS; fresh(); Auto_Update();
+  nearer = current_target_id;
+  assert(nearer && nearer != first && planned_route.count == 0 && planner_calls == 0);
+  Motor_ProcessCommand('M'); Motor_ProcessCommand('P');
+  assert(strstr(test_log, "DIST RANK=1") && strstr(test_log, "MODE=GREEDY"));
+  robot_pose.x_mm = Greedy_Find(nearer, clock_ms)->x_mm - 200;
+  clock_ms += 20; Auto_Update(); assert(auto_state == AUTO_FINAL_ALIGN);
+  Greedy_Observe(2, robot_pose.x_mm+60, robot_pose.y_mm, 100, clock_ms);
+  greedy_frame(100); clock_ms += 20; Auto_Update();
+  assert(auto_state == AUTO_COLLECT && current_target_id == nearer); /* near lock */
+  clock_ms += AUTO_COLLECT_DURATION_MS; fresh(); Auto_Update();
+  assert(Greedy_CountCollected() == 1 && auto_state == AUTO_PLAN);
+  clock_ms += AUTO_VISION_TIMEOUT_MS + 1; Auto_Update();
+  assert(!motor_running && vision_motion_hold && Greedy_CountCollected() == 1);
+  assert(!Auto_AvailableCount());
+  fresh(); clock_ms += 20; Auto_Update(); assert(auto_state == AUTO_SCAN);
+  Motor_ProcessCommand('J');
+  clock_ms += COLLECTOR_DIRECTION_PAUSE_MS; CollectorRecovery_Update();
+  clock_ms += COLLECTOR_REVERSE_DURATION_MS; CollectorRecovery_Update();
+  clock_ms += COLLECTOR_DIRECTION_PAUSE_MS; CollectorRecovery_Update();
+  assert(greedy_active && auto_state == AUTO_SCAN && Greedy_CountCollected() == 1);
+  Motor_ProcessCommand('S'); fresh(); Auto_Update();
+  assert(!greedy_active && auto_state == AUTO_IDLE && !motor_running);
+  Motor_ProcessCommand('Q'); Motor_ProcessCommand('A'); assert(!greedy_active);
+  Motor_ProcessCommand('Q'); Motor_ProcessCommand('C'); assert(!greedy_active && CombatStrategy_IsActive());
+  Motor_ProcessCommand('Q'); Motor_ProcessCommand('D'); assert(!greedy_active && auto_state == AUTO_DEBUG);
+  puts("PASS: Q nearest retarget, near lock, M/P list, vision hold, unjam preserves count and mode/stop isolation");
+}
+
+static void test_greedy_ten_then_unload(void)
+{
+  unsigned i;
+  reset_test(); Motor_ProcessCommand('Q'); fresh();
+  /* A full empty rotation repeats scanning and never unloads early. */
+  scan_accumulated_angle = AUTO_SCAN_MIN_ROTATION_RAD;
+  clock_ms += 20; Auto_Update(); clock_ms += 20; Auto_Update();
+  assert(auto_state == AUTO_SCAN && !MissionExtension_HasPayload());
+  for (i = 0; i < GREEDY_BATCH_SIZE; i++)
+  {
+    robot_pose = (RobotPose_t){500 + i*200.0f, 1000, 0};
+    greedy_frame(100); /* one frame/quality zero is enough */
+    if (auto_state == AUTO_SCAN) { clock_ms += 20; Auto_Update(); }
+    clock_ms += 20; Auto_Update(); assert(auto_state == AUTO_NAVIGATE);
+    clock_ms += 20; Auto_Update(); assert(auto_state == AUTO_FINAL_ALIGN);
+    clock_ms += 20; Auto_Update(); assert(auto_state == AUTO_COLLECT);
+    clock_ms += AUTO_COLLECT_DURATION_MS; fresh(); Auto_Update();
+    assert(Greedy_CountCollected() == i+1);
+    if (i+1 < GREEDY_BATCH_SIZE)
+    {
+      Mission_UpdateIntegration(); assert(MissionExtension_GetUnloadState() == MISSION_UNLOAD_IDLE);
+      Auto_BuildPlan(); assert(auto_state == AUTO_SCAN); /* empty but <10 keeps searching */
+    }
+  }
+  assert(auto_state == AUTO_COMPLETE && planner_calls == 0);
+  assert(strstr(test_log, "GREEDY COLLECTED=10/10 ASSUMED=1"));
+  Mission_UpdateIntegration(); assert(MissionExtension_GetUnloadState() == MISSION_UNLOAD_GO_STAGE);
+  robot_pose = (RobotPose_t){MISSION_UNLOAD_STAGE_X_MM, MISSION_UNLOAD_STAGE_Y_MM, 0};
+  Mission_UpdateIntegration(); Mission_UpdateIntegration();
+  assert(MissionExtension_GetUnloadState() == MISSION_UNLOAD_REVERSE);
+  robot_pose.x_mm = MISSION_UNLOAD_STOP_X_MM;
+  Mission_UpdateIntegration(); Mission_UpdateIntegration();
+  assert(MissionExtension_GetUnloadState() == MISSION_UNLOAD_EJECT && servo_updates > 0);
+  clock_ms += 5000; Mission_UpdateIntegration();
+  assert(MissionExtension_GetUnloadState() == MISSION_UNLOAD_DONE && !MissionExtension_HasPayload());
+  greedy_frame(100); clock_ms += 20; Auto_Update(); Mission_UpdateIntegration();
+  assert(auto_state == AUTO_COMPLETE && Greedy_CountCollected() == 10);
+  assert(MissionExtension_GetUnloadState() == MISSION_UNLOAD_DONE && !motor_running);
+  puts("PASS: empty scans keep searching, ten actual state-machine pickup actions trigger one return/reverse/servo unload, then stop");
+}
+
 int main(void)
 {
   reset_test(); test_pwm(); test_loss_and_recovery(); test_missing_target();
@@ -867,6 +999,7 @@ int main(void)
   test_recovery_resume_and_servo_exclusion();
   test_feedback_commands_and_auto(); test_feedback_fault_and_manual_counting();
   test_ultrasound_wrap();
+  test_greedy_memory(); test_greedy_transitions(); test_greedy_ten_then_unload();
   puts("control regression tests passed");
   return 0;
 }
@@ -878,7 +1011,7 @@ with tempfile.TemporaryDirectory(prefix='car-control-test-') as tmp:
     test_c = Path(tmp) / 'control_test.c'
     test_bin = Path(tmp) / 'control_test'
     test_c.write_text(program)
-    sources = ['path_planner', 'target_map', 'vision_protocol', 'brush_feedback',
+    sources = ['path_planner', 'target_map', 'vision_protocol', 'brush_feedback', 'greedy_collection',
                'mission_extension', 'combat_strategy']
     subprocess.run(shlex.split(os.environ.get('CC', 'cc')) +
                    ['-std=c11', '-Wall', '-Wextra', '-Werror',
