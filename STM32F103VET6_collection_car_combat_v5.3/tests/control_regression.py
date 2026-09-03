@@ -37,7 +37,10 @@ names = ['Motor_ClampPercent', 'Motor_SetOne', 'Motor_Set', 'Motor_SetTarget',
          'Auto_Update', 'Auto_BuildPlan', 'Auto_FindCurrentVisionTarget',
          'Auto_DriveTowardLocal', 'Mission_UpdateIntegration',
          'motor3_forward', 'Vision_ApplyFrame', 'Mission_ServoUpdate',
-         'Motor_ProcessCommand', 'Motor_ApplyDriveCommand']
+         'Motor_ProcessCommand', 'Motor_ApplyDriveCommand', 'Debug_Start',
+         'Debug_Update', 'Vision_ReportTelemetry', 'Robot_ModeName',
+         'Bluetooth_QueueFromISR', 'Bluetooth_GetCommand', 'Bluetooth_ProcessPending',
+         'Vision_ProcessIncoming']
 functions = [function(name) for name in names]
 prefix = r'''
 #include <assert.h>
@@ -74,6 +77,10 @@ static void FakeCompare(FakeTimer *timer, unsigned channel, unsigned duty)
   if (timer == &htim8) brush_writes++;
 }
 static uint32_t clock_ms, mode_requests;
+static unsigned test_irq_mask;
+static unsigned __get_PRIMASK(void) { return test_irq_mask; }
+static void __disable_irq(void) { test_irq_mask = 1; }
+static void __set_PRIMASK(unsigned mask) { test_irq_mask = mask; }
 static uint32_t HAL_GetTick(void) { return clock_ms; }
 static void HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, int value)
 {
@@ -82,8 +89,12 @@ static void HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, int value)
 }
 static void Vision_SendMode(char mode, uint8_t color)
 { (void)mode; (void)color; mode_requests++; }
-static void Motor_SendText(const char *text) { (void)text; }
-static void Buzzer_NotifyTargetFound(void) {}
+static char test_log[16384];
+static void Motor_SendText(const char *text)
+{
+  size_t used = strlen(test_log);
+  snprintf(test_log + used, sizeof(test_log)-used, "%s", text);
+}
 static void Servo_StartEject(void) {}
 static void Servo_Stop(void) {}
 static void Servo_Update(uint32_t now) { (void)now; servo_updates++; }
@@ -121,6 +132,15 @@ static void reset_test(void)
   auto_state_start_tick = clock_ms;
   hc_distance_mm = 0;
   empty_plan_retry_count = 0;
+  debug_action = "OFF";
+  debug_target_index = -1;
+  vision_report_tick = 0;
+  vision_report_due = 1;
+  memset(vision_filter_reason, 0, sizeof(vision_filter_reason));
+  test_log[0] = '\0';
+  bluetooth_read_index = bluetooth_write_index = bluetooth_stop_pending = 0;
+  bluetooth_drop_count = 0;
+  VisionProtocol_Init();
   motor3_forward(COLLECTOR_RUN_PWM); /* same command as firmware startup */
   brush_writes = 0;
   servo_updates = 0;
@@ -301,10 +321,189 @@ static void test_manual_and_fault(void)
   assert_brush_continues();
   puts("PASS: Bluetooth start/stop/reset and unload fault do not change front brush");
 }
+
+static void test_debug_direct_follow(void)
+{
+  VisionFrame_t frame = {0};
+  reset_test();
+  Motor_ProcessCommand('d');
+  assert(auto_state == AUTO_DEBUG && CombatStrategy_IsActive() == 0);
+  Auto_Update();
+  assert(vision_motion_hold == 1 && left_target_percent == 0);
+  assert(strcmp(debug_action, "WAIT_FRAME") == 0);
+
+  /* Deliberately bogus global pose: debug uses camera-relative coordinates. */
+  robot_pose = (RobotPose_t){-5000, -5000, 0};
+  frame.target_count = 1;
+  frame.targets[0] = (VisionTarget_t){1, 0, 500, 0, 150};
+  Vision_ApplyFrame(&frame);
+  Auto_Update();
+  assert(strcmp(debug_action, "FOLLOW") == 0);
+  assert(left_target_percent > 0 && right_target_percent == left_target_percent);
+  assert(TargetMap_CountAvailable(&target_map) == 0 && planned_route.count == 0);
+  assert(strcmp(vision_filter_reason[0], "DEBUG_BYPASS") == 0);
+  assert_brush_continues();
+
+  frame.targets[0].lateral_mm = 200;
+  Vision_ApplyFrame(&frame); Auto_Update();
+  assert(left_target_percent > 0 && right_target_percent < 0);
+  assert(strcmp(debug_action, "TURN_RIGHT") == 0);
+  frame.targets[0].lateral_mm = -200;
+  Vision_ApplyFrame(&frame); Auto_Update();
+  assert(left_target_percent < 0 && right_target_percent > 0);
+  assert(strcmp(debug_action, "TURN_LEFT") == 0);
+
+  frame.targets[0].lateral_mm = 0;
+  frame.targets[0].forward_mm = 100;
+  Vision_ApplyFrame(&frame); Auto_Update();
+  assert(left_target_percent == 0 && strcmp(debug_action, "NEAR") == 0);
+  frame.targets[0].forward_mm = 500;
+  hc_distance_mm = 100;
+  Vision_ApplyFrame(&frame); Auto_Update();
+  assert(left_target_percent == 0 && strcmp(debug_action, "OBSTACLE") == 0);
+  hc_distance_mm = 0;
+
+  frame.target_count = 2;
+  frame.targets[0] = (VisionTarget_t){1, 0, 500, 99, 1000};
+  frame.targets[1] = (VisionTarget_t){2, -100, 200, 0, 150};
+  Vision_ApplyFrame(&frame); Auto_Update();
+  assert(debug_target_index == 1); /* nearer target wins even with quality 0 */
+  frame.target_count = 0;
+  Vision_ApplyFrame(&frame); Auto_Update();
+  assert(left_target_percent == 0 && right_target_percent == 0);
+  assert(vision_motion_hold == 0 && strcmp(debug_action, "NO_TARGET") == 0);
+
+  frame.target_count = 1;
+  frame.targets[0] = (VisionTarget_t){1, 0, 500, 1, 150};
+  Vision_ApplyFrame(&frame); Auto_Update();
+  clock_ms += DEBUG_VISION_TIMEOUT_MS + 1;
+  Auto_Update(); Mission_UpdateIntegration();
+  assert(auto_state == AUTO_DEBUG && vision_motion_hold == 1);
+  assert(left_target_percent == 0 && right_target_percent == 0);
+  assert(strcmp(debug_action, "LOST") == 0);
+  Vision_ApplyFrame(&frame); Auto_Update();
+  assert(auto_state == AUTO_DEBUG && strcmp(debug_action, "FOLLOW") == 0);
+  assert(planned_route.count == 0 && !MissionExtension_HasPayload());
+  frame.targets[0].forward_mm = 0;
+  Vision_ApplyFrame(&frame); Auto_Update();
+  assert(left_target_percent == 0 && debug_target_index == -1);
+  assert_brush_continues();
+  puts("PASS: D follows one quality-0 observation without map/planning; left/right, empty, near, obstacle and stale handling");
+}
+
+static void test_mode_switch_and_stop(void)
+{
+  reset_test();
+  MissionExtension_RecordCollected();
+  MissionExtension_StartUnload(clock_ms);
+  Motor_ProcessCommand('D');
+  assert(MissionExtension_GetUnloadState() == MISSION_UNLOAD_IDLE);
+  assert(strcmp(Robot_ModeName(), "DEBUG") == 0);
+  Motor_ProcessCommand('C');
+  assert(CombatStrategy_IsActive() && auto_state == AUTO_SCAN);
+  assert(strcmp(Robot_ModeName(), "COMBAT") == 0);
+  assert(strcmp(debug_action, "OFF") == 0);
+  Motor_ProcessCommand('A');
+  assert(!CombatStrategy_IsActive() && auto_state == AUTO_SCAN);
+  assert(strcmp(Robot_ModeName(), "TECH") == 0);
+  Motor_ProcessCommand('D');
+  Motor_ProcessCommand('S');
+  assert(auto_state == AUTO_IDLE && strcmp(Robot_ModeName(), "MANUAL") == 0);
+  fresh(); Auto_Update(); Mission_UpdateIntegration();
+  assert(left_target_percent == 0 && right_target_percent == 0);
+  MissionExtension_RecordCollected();
+  MissionExtension_StartUnload(clock_ms);
+  auto_state = AUTO_COMPLETE;
+  Motor_ProcessCommand('S');
+  Mission_UpdateIntegration();
+  assert(MissionExtension_GetUnloadState() == MISSION_UNLOAD_IDLE);
+  assert(MissionExtension_HasPayload()); /* stop preserves inventory */
+  Motor_ProcessCommand('D'); Motor_ProcessCommand('0');
+  assert(auto_state == AUTO_IDLE && left_target_percent == 0);
+  assert_brush_continues();
+  puts("PASS: A/C/D mode switches, stop cancels debug/unload and late frames cannot restart stopped wheels");
+}
+
+static void test_bluetooth_queue(void)
+{
+  uint8_t command;
+  unsigned i;
+  reset_test();
+  Bluetooth_QueueFromISR('a'); Bluetooth_QueueFromISR('c'); Bluetooth_QueueFromISR('d');
+  assert(Bluetooth_GetCommand(&command) && command == 'A');
+  assert(Bluetooth_GetCommand(&command) && command == 'C');
+  assert(Bluetooth_GetCommand(&command) && command == 'D');
+  assert(!Bluetooth_GetCommand(&command) && test_irq_mask == 0);
+  Bluetooth_QueueFromISR('F'); Bluetooth_QueueFromISR('S'); Bluetooth_QueueFromISR('D');
+  assert(Bluetooth_GetCommand(&command) && command == 'S');
+  assert(!Bluetooth_GetCommand(&command));
+  for (i = 0; i < BLUETOOTH_QUEUE_SIZE + 4; i++) Bluetooth_QueueFromISR('F');
+  assert(bluetooth_drop_count == 1);
+  Bluetooth_ProcessPending();
+  assert(auto_state == AUTO_IDLE && left_target_percent == 0);
+  Bluetooth_QueueFromISR('D'); Bluetooth_ProcessPending();
+  assert(auto_state == AUTO_DEBUG);
+  Bluetooth_QueueFromISR('X'); Bluetooth_QueueFromISR('S');
+  assert(Bluetooth_GetCommand(&command) && command == 'X');
+  puts("PASS: Bluetooth FIFO preserves order; stop/reset priority and overflow stop");
+}
+
+static void feed_payload(const char *payload)
+{
+  char packet[160];
+  unsigned checksum = 0, i;
+  for (i = 0; payload[i] != '\0'; i++) checksum ^= (unsigned char)payload[i];
+  snprintf(packet, sizeof(packet), "$%s*%02X\r\n", payload, checksum);
+  for (i = 0; packet[i] != '\0'; i++) VisionProtocol_RxByteFromISR(packet[i]);
+}
+
+static void test_vision_telemetry(void)
+{
+  VisionFrame_t frame = {0};
+  reset_test();
+  Vision_ReportTelemetry(1);
+  assert(strstr(test_log, "VISION NO_FRAME") != NULL);
+  test_log[0] = '\0';
+  feed_payload("F,20,1"); feed_payload("T,20,0,1,-50,500,5,150"); feed_payload("E,20");
+  Vision_ProcessIncoming();
+  Vision_ReportTelemetry(1);
+  assert(strstr(test_log, "RAW=1") && strstr(test_log, "Q=5"));
+  assert(strstr(test_log, "FILTER=LOW_Q") && TargetMap_CountAvailable(&target_map) == 0);
+  test_log[0] = '\0';
+  frame.target_count = 1;
+  frame.targets[0] = (VisionTarget_t){1, 0, 500, 30, 200};
+  Vision_ApplyFrame(&frame); Vision_ReportTelemetry(1);
+  assert(strstr(test_log, "RAW=1 MAP=0") && strstr(test_log, "FILTER=OK"));
+  assert(TargetMap_CountAvailable(&target_map) == 0);
+  Vision_ApplyFrame(&frame);
+  assert(TargetMap_CountAvailable(&target_map) == 1); /* A/C policy preserved */
+  robot_pose.x_mm = -5000;
+  Vision_ApplyFrame(&frame); test_log[0] = '\0'; Vision_ReportTelemetry(1);
+  assert(strstr(test_log, "FILTER=OUTSIDE"));
+  Motor_ProcessCommand('D');
+  feed_payload("F,21,1"); feed_payload("T,21,0,1,0,500,0,150"); feed_payload("E,21");
+  Vision_ProcessIncoming(); Auto_Update();
+  test_log[0] = '\0'; Vision_ReportTelemetry(1);
+  assert(strstr(test_log, "Q=0") && strstr(test_log, "FILTER=DEBUG_BYPASS"));
+  assert(strstr(test_log, "MODE=DEBUG DBG=FOLLOW"));
+  clock_ms += DEBUG_VISION_TIMEOUT_MS + 1;
+  test_log[0] = '\0'; Vision_ReportTelemetry(1);
+  assert(strstr(test_log, "VISION STALE") && !strstr(test_log, "SEEN"));
+  feed_payload("F,22,0"); feed_payload("E,22");
+  Vision_ProcessIncoming(); Auto_Update();
+  test_log[0] = '\0'; Vision_ReportTelemetry(1);
+  assert(strstr(test_log, "VISION OK") && strstr(test_log, "RAW=0"));
+  assert(strstr(test_log, "DBG=NO_TARGET"));
+  test_log[0] = '\0'; Vision_ReportTelemetry(0);
+  assert(test_log[0] == '\0'); /* periodic output is rate limited */
+  puts("PASS: actual UART parser to telemetry: raw Q, filter causes, confirmations, no-frame/empty/stale distinction");
+}
 int main(void)
 {
   reset_test(); test_pwm(); test_loss_and_recovery(); test_missing_target();
   test_deposit_next_batch(); test_scope_and_override(); test_manual_and_fault();
+  test_debug_direct_follow(); test_mode_switch_and_stop();
+  test_bluetooth_queue(); test_vision_telemetry();
   puts("control regression tests passed");
   return 0;
 }

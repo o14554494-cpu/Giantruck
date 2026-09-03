@@ -55,7 +55,8 @@ typedef enum
   AUTO_COLLECT,
   AUTO_RECOVER,
   AUTO_COMBAT_PATROL,
-  AUTO_COMPLETE
+  AUTO_COMPLETE,
+  AUTO_DEBUG
 } AutoState_t;
 
 /* USER CODE END PTD */
@@ -108,6 +109,11 @@ typedef enum
 #define AUTO_RECOVER_DURATION_MS           900U
 #define AUTO_VISION_TIMEOUT_MS             1200U
 #define AUTO_VISION_RETRY_MS               500U
+#define DEBUG_VISION_TIMEOUT_MS            600U
+#define DEBUG_FORWARD_PERCENT             20
+#define DEBUG_TURN_PERCENT                18
+#define VISION_REPORT_PERIOD_MS            500U
+#define BLUETOOTH_QUEUE_SIZE               32U
 /* Independent front brush: runs continuously after peripheral startup.
  * Raw TIM8 compare value, 0..1000; 500 = 50% duty. */
 #define COLLECTOR_RUN_PWM                  500U
@@ -121,16 +127,10 @@ typedef enum
 #define VISION_MAX_FORWARD_MM               2500U
 #define VISION_MIN_ACCEPTED_QUALITY         15U
 
-/* Active buzzer used for target-found notification. The commonly used
- * STM32F103VET6 board routes its buzzer to PB8. If the actual carrier board
- * uses another pin, only these definitions need to be changed. */
+/* Target notifications now use Bluetooth; hold the old buzzer inactive. */
 #define BUZZER_PORT                         GPIOB
 #define BUZZER_PIN                          GPIO_PIN_8
-#define BUZZER_ACTIVE_STATE                 GPIO_PIN_SET
 #define BUZZER_INACTIVE_STATE               GPIO_PIN_RESET
-#define BUZZER_PULSE_MS                     120U
-#define BUZZER_GAP_MS                        90U
-#define BUZZER_MAX_PENDING_PULSES             8U
 
 #define MOTOR_LEFT_IN1_PORT       GPIOC
 #define MOTOR_LEFT_IN1_PIN        GPIO_PIN_0
@@ -204,7 +204,17 @@ static float combat_patrol_x_mm;
 static float combat_patrol_y_mm;
 static AutoState_t auto_state = AUTO_IDLE;
 static volatile uint8_t uart_packet_active;
-static volatile uint8_t manual_command_pending;
+static volatile uint8_t bluetooth_queue[BLUETOOTH_QUEUE_SIZE];
+static volatile uint8_t bluetooth_read_index;
+static volatile uint8_t bluetooth_write_index;
+static volatile uint8_t bluetooth_stop_pending;
+static volatile uint32_t bluetooth_drop_count;
+static uint32_t vision_report_tick;
+static uint8_t vision_report_due = 1U;
+/* Per-observation result for diagnostics: raw detections are always reported. */
+static const char *vision_filter_reason[VISION_MAX_TARGETS];
+static const char *debug_action = "OFF";
+static int16_t debug_target_index = -1;
 
 static volatile uint32_t hc_distance_mm;
 static uint32_t hc_last_sample_tick;
@@ -214,9 +224,6 @@ static uint8_t hc_close_count;
 
 /* 蓝牙 G 命令手动测试舵机时置 1，测试结束或进入自动卸货后清 0 */
 static uint8_t servo_test_active;
-static uint8_t buzzer_active;
-static uint8_t buzzer_pending_pulses;
-static uint32_t buzzer_state_tick;
 
 /* 电机启动补偿状态（每个通道独立） */
 static int16_t  ch1_last_target = 0;       /* CH1上一次的目标占空比 */
@@ -245,8 +252,13 @@ static void Motor_ProcessCommand(uint8_t command);
 static void Motor_SendText(const char *text);
 static void Motor_SendStatus(void);
 static void Buzzer_Init(void);
-static void Buzzer_NotifyTargetFound(void);
-static void Buzzer_Update(void);
+static void Bluetooth_QueueFromISR(uint8_t command);
+static uint8_t Bluetooth_GetCommand(uint8_t *command);
+static void Bluetooth_ProcessPending(void);
+static void Vision_ReportTelemetry(uint8_t force);
+static void Debug_Start(void);
+static void Debug_Update(uint32_t now);
+static const char *Robot_ModeName(void);
 static void Robot_UpdateOdometry(int32_t left_delta, int32_t right_delta);
 static void Vision_ProcessIncoming(void);
 static void Vision_ApplyFrame(const VisionFrame_t *frame);
@@ -290,46 +302,61 @@ static void Buzzer_Init(void)
   HAL_GPIO_Init(BUZZER_PORT, &gpio);
   HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, BUZZER_INACTIVE_STATE);
 
-  buzzer_active = 0U;
-  buzzer_pending_pulses = 0U;
-  buzzer_state_tick = HAL_GetTick();
 }
 
-static void Buzzer_NotifyTargetFound(void)
+static void Bluetooth_QueueFromISR(uint8_t command)
 {
-  if (buzzer_active == 0U)
+  uint8_t next;
+  if (command >= 'a' && command <= 'z') command -= ('a' - 'A');
+  if (command == '\r' || command == '\n' || command == '$') return;
+  if (command == 'S' || command == 'X' || command == '0')
   {
-    HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, BUZZER_ACTIVE_STATE);
-    buzzer_active = 1U;
-    buzzer_state_tick = HAL_GetTick();
+    bluetooth_read_index = bluetooth_write_index;
+    if (bluetooth_stop_pending != 'X') bluetooth_stop_pending = command;
+    return;
   }
-  else if (buzzer_pending_pulses < BUZZER_MAX_PENDING_PULSES)
+  /* A queued stop wins over subsequent motion in the same input burst. */
+  if (bluetooth_stop_pending != 0U) return;
+  next = (uint8_t)((bluetooth_write_index + 1U) % BLUETOOTH_QUEUE_SIZE);
+  if (next == bluetooth_read_index)
   {
-    buzzer_pending_pulses++;
+    bluetooth_drop_count++;
+    bluetooth_read_index = bluetooth_write_index;
+    bluetooth_stop_pending = 'S';
+    return;
   }
+  bluetooth_queue[bluetooth_write_index] = command;
+  bluetooth_write_index = next;
 }
 
-static void Buzzer_Update(void)
+static uint8_t Bluetooth_GetCommand(uint8_t *command)
 {
-  uint32_t now = HAL_GetTick();
+  uint8_t available = 0U;
+  uint32_t irq_mask = __get_PRIMASK();
+  __disable_irq();
+  if (bluetooth_stop_pending != 0U)
+  {
+    *command = bluetooth_stop_pending;
+    bluetooth_stop_pending = 0U;
+    bluetooth_read_index = bluetooth_write_index;
+    available = 1U;
+  }
+  else if (bluetooth_read_index != bluetooth_write_index)
+  {
+    *command = bluetooth_queue[bluetooth_read_index];
+    bluetooth_read_index = (uint8_t)((bluetooth_read_index + 1U) % BLUETOOTH_QUEUE_SIZE);
+    available = 1U;
+  }
+  __set_PRIMASK(irq_mask);
+  return available;
+}
 
-  if (buzzer_active != 0U)
-  {
-    if ((now - buzzer_state_tick) >= BUZZER_PULSE_MS)
-    {
-      HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, BUZZER_INACTIVE_STATE);
-      buzzer_active = 0U;
-      buzzer_state_tick = now;
-    }
-  }
-  else if ((buzzer_pending_pulses != 0U) &&
-           ((now - buzzer_state_tick) >= BUZZER_GAP_MS))
-  {
-    buzzer_pending_pulses--;
-    HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, BUZZER_ACTIVE_STATE);
-    buzzer_active = 1U;
-    buzzer_state_tick = now;
-  }
+static void Bluetooth_ProcessPending(void)
+{
+  uint8_t command;
+  uint8_t budget = 4U;
+  while (budget-- != 0U && Bluetooth_GetCommand(&command) != 0U)
+    Motor_ProcessCommand(command);
 }
 
 static float Robot_AbsFloat(float value)
@@ -350,6 +377,7 @@ static const char *Auto_StateName(AutoState_t state)
     case AUTO_RECOVER:     return "RECOVER";
     case AUTO_COMBAT_PATROL:return "PATROL";
     case AUTO_COMPLETE:    return "COMPLETE";
+    case AUTO_DEBUG:       return "DEBUG";
     default:               return "UNKNOWN";
   }
 }
@@ -627,6 +655,7 @@ static void Motor_ApplyDriveCommand(uint8_t command)
 
 static void Motor_ProcessCommand(uint8_t command)
 {
+  char reply[24];
   if ((command >= 'a') && (command <= 'z'))
   {
     command = (uint8_t)(command - ('a' - 'A'));
@@ -638,7 +667,10 @@ static void Motor_ProcessCommand(uint8_t command)
 
     if (motor_speed_percent == 0U)
     {
-      Motor_Stop();
+      servo_test_active = 0U;
+      Servo_Stop();
+      CombatStrategy_Stop();
+      Auto_Stop(0U);
     }
     else if (last_drive_command != 'S')
     {
@@ -664,7 +696,8 @@ static void Motor_ProcessCommand(uint8_t command)
       }
       CombatStrategy_Stop();
       Motor_ApplyDriveCommand(command);
-      Motor_SendText("OK\r\n");
+      (void)snprintf(reply, sizeof(reply), "CMD=%c OK\r\n", command);
+      Motor_SendText(reply);
       break;
 
     case 'A':
@@ -681,6 +714,11 @@ static void Motor_ProcessCommand(uint8_t command)
       CombatStrategy_Start(HAL_GetTick());
       Auto_Start();
       Motor_SendText("COMBAT MODE STARTED: 5 MIN ROLLING STRATEGY\r\n");
+      break;
+
+    case 'D':
+      Debug_Start();
+      Motor_SendText("MODE=DEBUG: ONE FRAME FOLLOW, NO MAP/QUALITY GATE\r\n");
       break;
 
     case 'X':
@@ -701,6 +739,7 @@ static void Motor_ProcessCommand(uint8_t command)
 
     case 'V':
       Motor_SendStatus();
+      Vision_ReportTelemetry(1U);
       break;
 
     case 'G':
@@ -777,6 +816,58 @@ static void Motor_SendStatus(void)
                  (unsigned int)CombatStrategy_GetPayloadCount(),
                  (unsigned long)CombatStrategy_OpponentDwellMs(now));
   Motor_SendText(status);
+  (void)snprintf(status, sizeof(status), "MODE=%s DBG=%s PICK=%d BTDROP=%lu\r\n",
+                 Robot_ModeName(), debug_action, (int)debug_target_index,
+                 (unsigned long)bluetooth_drop_count);
+  Motor_SendText(status);
+}
+
+static const char *Robot_ModeName(void)
+{
+  if (auto_state == AUTO_DEBUG) return "DEBUG";
+  if (CombatStrategy_IsActive() != 0U) return "COMBAT";
+  if (auto_state == AUTO_IDLE) return "MANUAL";
+  return "TECH";
+}
+
+static void Vision_ReportTelemetry(uint8_t force)
+{
+  char line[176];
+  uint8_t index;
+  uint32_t now = HAL_GetTick();
+  uint32_t age = now - latest_vision_tick;
+  uint32_t timeout = auto_state == AUTO_DEBUG ? DEBUG_VISION_TIMEOUT_MS : AUTO_VISION_TIMEOUT_MS;
+  if (force == 0U && vision_report_due == 0U &&
+      (uint32_t)(now - vision_report_tick) < VISION_REPORT_PERIOD_MS) return;
+  vision_report_tick = now;
+  vision_report_due = 0U;
+  if (accepted_vision_frame_count == 0U)
+  {
+    (void)snprintf(line, sizeof(line), "VISION NO_FRAME RXERR=%lu MODE=%s DBG=%s\r\n",
+                   (unsigned long)VisionProtocol_GetErrorCount(), Robot_ModeName(), debug_action);
+    Motor_SendText(line);
+    return;
+  }
+  (void)snprintf(line, sizeof(line),
+      "VISION %s SEQ=%u RAW=%u MAP=%u AGE=%lu RXERR=%lu MODE=%s DBG=%s PICK=%d\r\n",
+      age > timeout ? "STALE" : "OK", (unsigned int)latest_vision_frame.sequence,
+      (unsigned int)latest_vision_frame.target_count,
+      (unsigned int)TargetMap_CountAvailable(&target_map), (unsigned long)age,
+      (unsigned long)VisionProtocol_GetErrorCount(), Robot_ModeName(), debug_action,
+      (int)debug_target_index);
+  Motor_SendText(line);
+  if (age > timeout) return;
+  for (index = 0U; index < latest_vision_frame.target_count; index++)
+  {
+    const VisionTarget_t *target = &latest_vision_frame.targets[index];
+    (void)snprintf(line, sizeof(line),
+        "SEEN I=%u C=%u X=%d Y=%u Q=%u PX=%lu FILTER=%s\r\n",
+        (unsigned int)index, (unsigned int)target->color, (int)target->lateral_mm,
+        (unsigned int)target->forward_mm, (unsigned int)target->quality,
+        (unsigned long)target->pixels,
+        vision_filter_reason[index] != NULL ? vision_filter_reason[index] : "UNKNOWN");
+    Motor_SendText(line);
+  }
 }
 
 static void Robot_UpdateOdometry(int32_t left_delta, int32_t right_delta)
@@ -826,6 +917,9 @@ static void Vision_ApplyFrame(const VisionFrame_t *frame)
     return;
   }
 
+  if (accepted_vision_frame_count == 0U ||
+      (latest_vision_frame.target_count == 0U && frame->target_count != 0U))
+    vision_report_due = 1U;
   latest_vision_frame = *frame;
   latest_vision_tick = now;
   accepted_vision_frame_count++;
@@ -842,10 +936,21 @@ static void Vision_ApplyFrame(const VisionFrame_t *frame)
     float global_x;
     float global_y;
 
+    vision_filter_reason[index] = "OK";
     if ((observation->forward_mm < VISION_MIN_FORWARD_MM) ||
-        (observation->forward_mm > VISION_MAX_FORWARD_MM) ||
-        (observation->quality < VISION_MIN_ACCEPTED_QUALITY))
+        (observation->forward_mm > VISION_MAX_FORWARD_MM))
     {
+      vision_filter_reason[index] = "RANGE";
+      continue;
+    }
+    if (auto_state == AUTO_DEBUG)
+    {
+      vision_filter_reason[index] = "DEBUG_BYPASS";
+      continue;
+    }
+    if (observation->quality < VISION_MIN_ACCEPTED_QUALITY)
+    {
+      vision_filter_reason[index] = "LOW_Q";
       continue;
     }
 
@@ -861,6 +966,7 @@ static void Vision_ApplyFrame(const VisionFrame_t *frame)
      * 3000 x 2000 mm fenced field. */
     if (MissionExtension_TargetInsideArena(global_x, global_y) == 0U)
     {
+      vision_filter_reason[index] = "OUTSIDE";
       continue;
     }
 
@@ -870,8 +976,7 @@ static void Vision_ApplyFrame(const VisionFrame_t *frame)
     available_after = TargetMap_CountAvailable(&target_map);
     if (available_after > available_before)
     {
-      Buzzer_NotifyTargetFound();
-      Motor_SendText("TARGET FOUND\r\n");
+      Motor_SendText("MAP TARGET CONFIRMED\r\n");
     }
   }
   plan_dirty = 1U;
@@ -902,6 +1007,9 @@ static void Auto_StartScan(uint32_t timeout_ms)
 
 static void Auto_Start(void)
 {
+  debug_action = "OFF";
+  debug_target_index = -1;
+  vision_report_due = 1U;
   Motor_Stop();
   memset(&robot_pose, 0, sizeof(robot_pose));
   memset(&planned_route, 0, sizeof(planned_route));
@@ -925,6 +1033,11 @@ static void Auto_Start(void)
 
 static void Auto_Stop(uint8_t clear_map)
 {
+  /* Manual takeover must also cancel a previous unloading/avoidance action. */
+  MissionExtension_CancelMotion();
+  debug_action = "OFF";
+  debug_target_index = -1;
+  vision_report_due = 1U;
   vision_motion_hold = 0U;
   auto_state = AUTO_IDLE;
   current_target_id = 0U;
@@ -943,6 +1056,85 @@ static void Auto_Stop(uint8_t clear_map)
     TargetMap_Reset(&target_map);
     MissionExtension_Reset();
     MissionExtension_SetInitialPose(&robot_pose);
+  }
+}
+
+static void Debug_Start(void)
+{
+  servo_test_active = 0U;
+  Servo_Stop();
+  CombatStrategy_Stop();
+  Auto_Stop(1U);
+  auto_state = AUTO_DEBUG;
+  debug_action = "WAIT_FRAME";
+  vision_report_due = 1U;
+  vision_retry_tick = HAL_GetTick();
+  last_auto_update_tick = HAL_GetTick();
+}
+
+static void Debug_Update(uint32_t now)
+{
+  uint8_t index;
+  const VisionTarget_t *target = NULL;
+  debug_target_index = -1;
+  if (accepted_vision_frame_count == 0U ||
+      (uint32_t)(now - latest_vision_tick) > DEBUG_VISION_TIMEOUT_MS)
+  {
+    Motor_Stop();
+    vision_motion_hold = 1U;
+    debug_action = accepted_vision_frame_count == 0U ? "WAIT_FRAME" : "LOST";
+    if ((uint32_t)(now - vision_retry_tick) >= AUTO_VISION_RETRY_MS)
+    {
+      vision_retry_tick = now;
+      Vision_SendMode('S', 0U);
+    }
+    return;
+  }
+  vision_motion_hold = 0U;
+  /* Select one observation directly: no quality, confirmation, map or route. */
+  for (index = 0U; index < latest_vision_frame.target_count; index++)
+  {
+    const VisionTarget_t *candidate = &latest_vision_frame.targets[index];
+    if ((candidate->color != VISION_COLOR_RED && candidate->color != VISION_COLOR_YELLOW) ||
+        candidate->forward_mm < VISION_MIN_FORWARD_MM ||
+        candidate->forward_mm > VISION_MAX_FORWARD_MM) continue;
+    if (target == NULL || candidate->forward_mm < target->forward_mm)
+    {
+      target = candidate;
+      debug_target_index = (int16_t)index;
+    }
+  }
+  if (target == NULL)
+  {
+    Motor_Stop();
+    debug_action = "NO_TARGET";
+    return;
+  }
+  if (target->forward_mm <= AUTO_COLLECT_TRIGGER_MM &&
+      Robot_AbsFloat((float)target->lateral_mm) <= AUTO_ALIGN_TOLERANCE_MM)
+  {
+    Motor_Stop();
+    debug_action = "NEAR";
+    return;
+  }
+  if (hc_distance_mm != 0U && hc_distance_mm <= MISSION_FRONT_STOP_MM)
+  {
+    Motor_Stop();
+    debug_action = "OBSTACLE";
+    return;
+  }
+  if (Robot_AbsFloat((float)target->lateral_mm) > AUTO_ALIGN_TOLERANCE_MM &&
+      Robot_AbsFloat((float)target->lateral_mm) > (float)target->forward_mm * 0.25f)
+  {
+    int16_t turn = target->lateral_mm > 0 ? DEBUG_TURN_PERCENT : -DEBUG_TURN_PERCENT;
+    Motor_SetTarget(turn, (int16_t)-turn);
+    debug_action = target->lateral_mm > 0 ? "TURN_RIGHT" : "TURN_LEFT";
+  }
+  else
+  {
+    Auto_DriveTowardLocal((float)target->forward_mm, -(float)target->lateral_mm,
+                          DEBUG_FORWARD_PERCENT);
+    debug_action = "FOLLOW";
   }
 }
 
@@ -1190,6 +1382,12 @@ static void Auto_Update(void)
 {
   uint32_t now = HAL_GetTick();
 
+  if (auto_state == AUTO_DEBUG)
+  {
+    /* Dedicated visual servo loop; never enter the planner or auto pickup. */
+    Debug_Update(now);
+    return;
+  }
   /* Run before the 20ms scheduling gate so a stale link cannot keep driving. */
   if (Auto_CheckVision(now) == 0U) return;
 
@@ -1512,6 +1710,8 @@ static void Mission_UpdateIntegration(void)
   uint32_t now = HAL_GetTick();
   MissionUnloadState_t unload_state = MissionExtension_GetUnloadState();
 
+  /* Debug has its own stop-only proximity check and no map-wall avoidance. */
+  if (auto_state == AUTO_DEBUG) return;
   /* Do not let the reactive avoidance state overwrite the vision hold. */
   if (vision_motion_hold != 0U)
   {
@@ -1755,7 +1955,7 @@ int main(void)
   Motor_Stop();
   Buzzer_Init();
   Vision_SendMode('S', 0U);
-  Motor_SendText("READY: A=TECH, C=COMBAT, F/B/L/R/S, X=RESET, M/P/V, G=SERVO\r\n");
+  Motor_SendText("READY: A=TECH, C=COMBAT, D=DEBUG, S=STOP, X=RESET, F/B/L/R, M/P/V, G=SERVO\r\n");
 
   //前刷独立常转：初始化完成后正转，不受视觉/驾驶/卸货状态控制//
   CollectorDirection_Init();
@@ -1779,14 +1979,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    if (manual_command_pending != 0U)
-    {
-      uint8_t command = manual_command_pending;
-      manual_command_pending = 0U;
-      Motor_ProcessCommand(command);
-    }
-
-    Buzzer_Update();
+    Bluetooth_ProcessPending();
 
     Vision_ProcessIncoming();
 
@@ -1798,6 +1991,7 @@ int main(void)
 
     Auto_Update();
     Mission_UpdateIntegration();
+    Vision_ReportTelemetry(0U);
 
     if ((CombatStrategy_IsActive() != 0U) &&
         ((auto_state == AUTO_NAVIGATE) ||
@@ -1827,13 +2021,6 @@ int main(void)
           hc_last_sample_tick = HAL_GetTick();
           hc_distance_mm = HCSR04_Measure();
 
-          /* 调试用:把距离发到串口,验证完可注释掉 */
-          {
-            char hc_line[48];
-            (void)snprintf(hc_line, sizeof(hc_line), "DIST=%lu mm\r\n",
-                           (unsigned long)hc_distance_mm);
-            Motor_SendText(hc_line);
-          }
 
           if (hc_distance_mm != 0U)
           {
@@ -1934,11 +2121,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     {
       uint8_t byte = bluetooth_rx_byte;
 
-      // 蓝牙只接收手动命令，不处理视觉协议包（$开头的）
-      if ((byte != '\r') && (byte != '\n') && (byte != '$'))
-      {
-        manual_command_pending = byte;
-      }
+      Bluetooth_QueueFromISR(byte);
 
       // 重新启动接收中断
       (void)HAL_UART_Receive_IT(&huart3, &bluetooth_rx_byte, 1U);

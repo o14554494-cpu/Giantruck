@@ -59,6 +59,8 @@ typedef struct
 } MissionDriveOutput_t;
 
 void MissionExtension_Reset(void);
+/* Cancel unloading and reactive avoidance without losing the payload count. */
+void MissionExtension_CancelMotion(void);
 void MissionExtension_SetInitialPose(RobotPose_t *pose);
 uint8_t MissionExtension_TargetInsideArena(float x_mm, float y_mm);
 

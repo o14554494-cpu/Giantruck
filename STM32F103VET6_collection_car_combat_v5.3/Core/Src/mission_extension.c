@@ -95,6 +95,16 @@ void MissionExtension_SetInitialPose(RobotPose_t *pose)
   pose->heading_rad = MISSION_START_HEADING_RAD;
 }
 
+void MissionExtension_CancelMotion(void)
+{
+  unload_state = MISSION_UNLOAD_IDLE;
+  unload_state_tick = 0U;
+  safety_state = SAFETY_CLEAR;
+  safety_state_tick = 0U;
+  safety_turn_sign = 1;
+  front_close_count = 0U;
+}
+
 uint8_t MissionExtension_TargetInsideArena(float x_mm, float y_mm)
 {
   return (x_mm >= MISSION_TARGET_MARGIN_MM) &&
